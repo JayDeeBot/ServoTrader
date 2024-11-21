@@ -3,7 +3,7 @@ Automated Trading Algorithm
 
 This repo consists of 5 classes that together make version 1 of the ServoTrader algorithm:
 
-1. DatabaseInitialiser - Creates a cvs of the initial database of stock close prices for a given set of stock codes, a given number of close prices, at a given interval.
+1. DatabaseInitialiser - Creates a csv of the initial database of stock close prices for a given set of stock codes, a given number of close prices, at a given interval.
 2. ServoData - Retrieves the latest set of stock close prices for the given set of stock codes.
 3. StockDataStore - Adds the latest data to the csv.
 4. ServoPredictor - Repairs the data set, creates a series of regression model for each stock, filters the models by confidence level and predicts the growth.
