@@ -1,0 +1,2 @@
+# ServoTrader
+Automated Trading Algorithm
