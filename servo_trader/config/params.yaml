@@ -1,0 +1,4 @@
+confidence_threshold: 90
+loop_interval_minutes: 1
+crypto_bars_to_analyse: 5000
+timeframe: minute
