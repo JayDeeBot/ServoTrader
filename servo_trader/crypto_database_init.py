@@ -93,8 +93,8 @@ class CryptoDatabaseInitialiser:
         return self.fetch_crypto_data(symbol, interval, desired_lines)
 
     def create_csv(self):
-        interval = self.params.get("loop_interval_minutes", 60)  # Default to 1-hour candles
-        desired_lines = self.params.get("desired_lines", 5000)  # Default to 5000 lines
+        interval = self.params.get("loop_interval_minutes", 1)  # Default to 1-minute candles
+        desired_lines = self.params.get("desired_lines", 10000)  # Default to 10000 lines
 
         all_data = []
         total_assets = len(self.crypto_codes)

@@ -31,10 +31,10 @@ License: MIT
 
 # envs/crypto_trading_env.py
 
-import gym
+import gymnasium as gym
+from gymnasium import spaces # Necessary for specifying valid actions & observations
 import numpy as np
 import pandas as pd
-from gym import spaces # Necessary for specifying valid actions & observations
 
 class CryptoTradingEnv(gym.Env):
     """
@@ -104,9 +104,9 @@ class CryptoTradingEnv(gym.Env):
             df_symbol = raw_df[raw_df['symbol'] == symbol].head(self.num_timesteps) # Select the first N rows for this symbol
             df_symbol = df_symbol[feature_cols].astype(float) # Convert features to float
             
-            # Fill prices with ffill then bfill
-            df_symbol[['open', 'high', 'low', 'close', 'vwap']] = df_symbol[['open', 'high', 'low', 'close', 'vwap']].fillna(method='ffill')
-            df_symbol[['open', 'high', 'low', 'close', 'vwap']] = df_symbol[['open', 'high', 'low', 'close', 'vwap']].fillna(method='bfill')
+            # Fill prices with forward-fill then back-fill
+            df_symbol[['open', 'high', 'low', 'close', 'vwap']] = df_symbol[['open', 'high', 'low', 'close', 'vwap']].ffill()
+            df_symbol[['open', 'high', 'low', 'close', 'vwap']] = df_symbol[['open', 'high', 'low', 'close', 'vwap']].bfill()
 
             # Fill volume and count with 0
             df_symbol[['volume', 'count']] = df_symbol[['volume', 'count']].fillna(0)
@@ -133,7 +133,11 @@ class CryptoTradingEnv(gym.Env):
     # Method reset: starts a new episode for training & initialises the environment state
     # Updates: start_index, current_step, active_crypto_index, buy_price, hold_duration, cash_balance, portfolio_value
     # Returns: Initial observation - observation at the current step
-    def reset(self):
+    def reset(self, *, seed=None, options=None):
+        super().reset(seed=seed)  # sets self.np_random if using Gym >=0.25
+        # Optional: set random seed manually if needed
+        if seed is not None:
+            self.seed(seed)
         self.start_index = np.random.randint(0, self.num_timesteps - self.timeout_steps - 1) # Randomly picks a starting timestep in the historical dataset
         self.current_step = self.start_index # Set the internal time pointer to the start index
         self.active_crypto_index = None # Reset the active crypto to none
@@ -141,7 +145,7 @@ class CryptoTradingEnv(gym.Env):
         self.hold_duration = 0 # Reset the hold duration to 0
         self.cash_balance = 1.0 # Reset the cash balance to 1
         self.portfolio_value = 1.0 # Reset the portfolio value to 1
-        return self._get_observation() # Return the initial observation - observation at the current step
+        return self._get_observation(), {} # Return the initial observation - observation at the current step
 
     # Method _get_observation: Returns the state vector that PPO will use as the observation at the current step - input for the neural network policy
     # Returns: Current observation (1D vector - Shape [num_cryptos*features_per_crypto])
@@ -150,6 +154,14 @@ class CryptoTradingEnv(gym.Env):
         Return the observation for current step as a flat 1D vector.
         """
         obs = self.data[self.current_step] # Grab all crypto data at the current timestep - 2D Matrix Shape [num_cryptos, features_per_crypto]
+        obs = np.nan_to_num(obs, nan=0.0, posinf=1e6, neginf=-1e6) # Replace any NaNs/Infs with safe numerical values
+        # Safety check: warn if unexpected values slipped through
+        if np.any(np.isnan(obs)) or np.any(np.isinf(obs)):
+            print(f"Warning: NaNs/Infs in observation at step {self.current_step}")
+            obs = np.nan_to_num(obs)
+        # Assert shape matches what PPO expects
+        assert obs.shape == self.observation_space.shape, \
+            f"Observation shape mismatch: expected {self.observation_space.shape}, got {obs.shape}"
         return obs.flatten() # Flatten the matrix into a single 1D vector expected by PPO - Shape [num_cryptos*features_per_crypto]
 
     # Method step: Defines how the agent interacts with the world at each time step
@@ -176,7 +188,10 @@ class CryptoTradingEnv(gym.Env):
             if self.active_crypto_index is not None: # If we are holding a crypto
                 self.hold_duration += 1 # Increment up the hold duration by 1 (adds 1 per episode held)
                 price_now = self.data[self.current_step, self.active_crypto_index, 3] # Save the current price
-                profit = (price_now - self.buy_price) / self.buy_price # Calculate the current profit
+                if self.buy_price is None or self.buy_price == 0 or np.isnan(self.buy_price): # Calculate the current profit
+                    profit = 0  # or np.nan or some fallback strategy
+                else:
+                    profit = (price_now - self.buy_price) / self.buy_price
                 reward = self._calculate_reward(profit, dense=True, price_series=self._get_price_series()) # Calculate the reward at this time step (dense)
 
                 if abs(profit) < 0.001: # If the profit is near 0
@@ -190,7 +205,10 @@ class CryptoTradingEnv(gym.Env):
         elif action == self.num_cryptos + 1:  # Sell
             if self.active_crypto_index is not None: # Check whether we are holding a crypto - prevents double selling
                 sell_price = self.data[self.current_step, self.active_crypto_index, 3] # Take the price at the current step for the current crypto as the sell price
-                profit = (sell_price - self.buy_price) / self.buy_price # Calculate the total profit
+                if self.buy_price is None or self.buy_price == 0 or np.isnan(self.buy_price): # Calculate the total profit
+                    profit = 0  # or handle however you prefer (e.g., skip trade)
+                else:
+                    profit = (sell_price - self.buy_price) / self.buy_price
                 self.portfolio_value *= (1 + profit) # Calculate the final portfolio value
                 reward = self._calculate_reward(profit, dense=False, price_series=self._get_price_series(), trade_executed=True) # Calculate the final reward for the episode
                 self._end_episode() # End the episode
@@ -203,14 +221,33 @@ class CryptoTradingEnv(gym.Env):
         # If we have exceeded the max steps for this episode or exceeded the max hold duration
         if self.current_step >= self.num_timesteps - 1 or self.hold_duration >= self.timeout_steps: # Check whether we have exceeded the max steps for this episode or the max hold duration
             done = True # Reset done flag
+            truncated = self.hold_duration >= self.timeout_steps # Ensure that the truncated flag accurately reflects if the episode ended due to timeout
             if self.active_crypto_index is not None: # Check whether there is an active crypto
                 final_price = self.data[self.current_step, self.active_crypto_index, 3] # Grab the final price
-                profit = (final_price - self.buy_price) / self.buy_price # Calculate the final profit
+                # Calculate the final profit
+                if self.buy_price is None or self.buy_price == 0 or np.isnan(self.buy_price):
+                    profit = 0
+                else:
+                    profit = (final_price - self.buy_price) / self.buy_price
                 reward = self._calculate_reward(profit, dense=False, price_series=self._get_price_series(), trade_executed=True) # Calculate the total reward
                 self._end_episode() # End the episode
 
         obs = self._get_observation() # Grab the current observation
-        return obs, reward, done, {} # Return the current observation, current/total reward & done flag
+
+        # --- Sanitize reward ---
+        if np.isnan(reward) or np.isinf(reward):
+            print(f"[Warning] Invalid reward encountered at step {self.current_step}: {reward}")
+            reward = 0.0
+
+        # --- Sanitize observation ---
+        if np.any(np.isnan(obs)) or np.any(np.isinf(obs)):
+            print(f"[Warning] Invalid observation at step {self.current_step}")
+            obs = np.nan_to_num(obs, nan=0.0, posinf=1e6, neginf=-1e6)
+
+        terminated = done  # or more precise logic if you distinguish between them
+        truncated = False  # or set to True based on a time limit or other criteria
+        info = {}          # define info as an empty dict (or add custom info here)
+        return obs, reward, terminated, truncated, info # Return the current observation, current/total reward & done flag
 
     # Method _calculate_reward: Calculates the current/total rewards at the current/last step of the episode
     # Arguments: profit = the current/final profit, dense = bool to flag whether the reward calc will be dense or not (true = dense),
@@ -231,7 +268,10 @@ class CryptoTradingEnv(gym.Env):
         risk_penalty = 0 # Init risk penalty as 0
         if price_series is not None and len(price_series) >= 10: # If price series is set
             returns = price_series.pct_change().fillna(0) # Compute the percentage change from one price to the next and convert Na's to 0
-            volatility = returns.std() # Calculate the volatility = standard deviation of returns
+            if returns.dropna().shape[0] > 1: # Calculate the volatility = standard deviation of returns
+                volatility = returns.std()
+            else:
+                volatility = 0 # or some small default like 1e-8 to avoid div-by-zero elsewhere
             if volatility > 0: # If the volatility if greater than 0
                 sharpe_like = profit / volatility # Calculate the Sharpe-style penalty = profit / volatility
                 risk_penalty = -abs(sharpe_like) * 0.5  # adjust strength here
@@ -258,6 +298,10 @@ class CryptoTradingEnv(gym.Env):
 
         # --- Combine with risk penalty (Sharpe-style) ---
         reward += risk_penalty
+
+        # Handle possible Nan Rewards
+        if not np.isfinite(reward):
+            reward = 0 # Give zero rewards if the value is Nan or infinite
 
         return reward
 

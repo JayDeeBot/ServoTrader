@@ -1,0 +1,75 @@
+
+# 🧠 PPO Training with TensorBoard Visualization
+
+This guide explains how to train your PPO agent and visualize results using TensorBoard.
+
+---
+
+## 🛠️ Training Script
+
+Ensure your training script logs to TensorBoard:
+
+```python
+model = PPO("MlpPolicy", env, verbose=1, tensorboard_log="../ppo_logs")
+```
+
+---
+
+## 🚀 Launch TensorBoard
+
+1. **Navigate to your project directory (e.g., `scripts/`)**:
+
+```bash
+cd scripts
+```
+
+2. **Launch TensorBoard**:
+
+```bash
+tensorboard --logdir=../ppo_logs
+```
+
+3. **Open your browser and go to**:
+
+[http://localhost:6006](http://localhost:6006)
+
+---
+
+## 📈 What You Can See
+
+- Total reward over time
+- Episode lengths
+- Policy loss
+- Value function loss
+- Entropy (exploration metric)
+
+---
+
+## 📂 Organizing Multiple Runs
+
+To keep logs separated by run:
+
+```python
+tensorboard_log="../ppo_logs/run_1"
+```
+
+This lets you compare different runs directly in TensorBoard.
+
+---
+
+## 🧪 Tips
+
+- Use `verbose=1` to monitor training in the terminal.
+- Save models with checkpointing to avoid losing progress.
+
+```python
+from stable_baselines3.common.callbacks import CheckpointCallback
+
+checkpoint = CheckpointCallback(
+    save_freq=10000, save_path="../models/", name_prefix="ppo_servo_trader"
+)
+```
+
+---
+
+Happy training! 🚀
