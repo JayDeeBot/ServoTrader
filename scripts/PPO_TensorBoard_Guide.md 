@@ -10,23 +10,15 @@ This guide explains how to train your PPO agent and visualize results using Tens
 Ensure your training script logs to TensorBoard:
 
 ```python
-model = PPO("MlpPolicy", env, verbose=1, tensorboard_log="../ppo_logs")
+model = PPO("MlpPolicy", env, verbose=1, tensorboard_log="/home/jarred/git/ServoTrader/logs/ppo_logs")
 ```
 
 ---
 
 ## 🚀 Launch TensorBoard
 
-1. **Navigate to your project directory (e.g., `scripts/`)**:
-
 ```bash
-cd scripts
-```
-
-2. **Launch TensorBoard**:
-
-```bash
-tensorboard --logdir=../ppo_logs
+tensorboard --logdir /home/jarred/git/ServoTrader/logs/ppo_logs --port 6006
 ```
 
 3. **Open your browser and go to**:

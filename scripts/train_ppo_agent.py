@@ -1,5 +1,5 @@
 """
-train_agent.py
+train_ppo_agent.py
 
 This script trains a Proximal Policy Optimization (PPO) reinforcement learning agent
 on a custom Gym environment designed for high-frequency crypto trading using historical
@@ -22,7 +22,7 @@ Project: ServoTrader
 License: MIT  
 """
 
-# scripts/train_agent.py
+# scripts/train_ppo_agent.py
 # python scripts/train_ppo_agent.py
 
 import sys
@@ -31,10 +31,15 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import pandas as pd
 import json
+import numpy as np
 from stable_baselines3 import PPO # Import the PPO (Proximal Policy Optimization algorithm) Agent
 from stable_baselines3.common.vec_env import DummyVecEnv 
 from servo_trader.envs.crypto_trading_env import CryptoTradingEnv # Import the custom training environment
 from stable_baselines3.common.callbacks import CheckpointCallback
+from stable_baselines3.common.monitor import Monitor # Necessary for monitoring rewards
+from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor
+from sb3_contrib import MaskablePPO, RecurrentPPO
+from sb3_contrib.common.wrappers import ActionMasker
 
 # --- Load crypto codes ---
 with open('/home/jarred/git/ServoTrader/servo_trader/config/crypto_codes.json') as f:
@@ -43,47 +48,90 @@ with open('/home/jarred/git/ServoTrader/servo_trader/config/crypto_codes.json') 
 # --- Load historical data ---
 historical_df = pd.read_csv('/home/jarred/git/ServoTrader/data/historical_crypto_data.csv')
 
-# --- Create environment ---
-def make_env():
-    return CryptoTradingEnv(data=historical_df, crypto_codes=crypto_codes, episode_timeout=15)
+# --- Define action masks --- This ensures that the legal rules are abided
+def action_masks(env):
+    """
+    Masks the action space to ensure only legal moves are possible.
 
-env = DummyVecEnv([make_env]) # Create the environment the agent will interact with
+    Legal moves:
+        - No Crypto Held: Buy actions only (1 to num_cryptos)
+        - Crypto Held: Hold (0) and Sell (num_cryptos + 1)
+
+    Returns:
+        mask (np array [bools]): an array of bools for each possible action, where each false index makes the action not possible.
+    """
+    mask = np.zeros(env.action_space.n, dtype=bool)  # Start all as False
+
+    if env.active_crypto_index is None:
+        # No crypto held → only Buy actions are legal
+        mask[1:env.num_cryptos + 1] = True
+    else:
+        # Crypto held → only Hold and Sell are legal
+        mask[0] = True  # Hold
+        mask[env.num_cryptos + 1] = True  # Sell
+
+    return mask
+
+# --- Create environment ---
+# Wrap the environment with action masking
+env = DummyVecEnv([
+    lambda: ActionMasker(
+        CryptoTradingEnv(data=historical_df, crypto_codes=crypto_codes, episode_timeout=15),
+        action_masks
+    )
+])
+env = VecMonitor(env)
+
+# Define PPO hyperparameters
+ppo_config = {
+    "learning_rate": 5e-5,
+    "n_steps": 512,
+    "batch_size": 64,
+    "gamma": 0.97,
+    "gae_lambda": 0.95,
+    "clip_range": 0.2,
+    "ent_coef": 0.01,
+    "vf_coef": 0.5,
+    "max_grad_norm": 0.5,
+    "normalize_advantage": True,
+    "device": "cpu",
+    "verbose": 1,
+    "tensorboard_log": "/home/jarred/git/ServoTrader/logs/ppo_logs"
+}
 
 # --- Set this flag to True if continuing training ---
 CONTINUE_TRAINING = False
 
 if CONTINUE_TRAINING:
     # --- Load existing model ---
-    model = PPO.load(
+    model = RecurrentPPO.load(
         "/home/jarred/git/ServoTrader/models/ppo_servo_trader",
         env=env,
-        tensorboard_log="../ppo_logs",
-        device="cpu",
-        learning_rate=1e-5,
-        policy_kwargs={"max_grad_norm": 0.5}
+        tensorboard_log="/home/jarred/git/ServoTrader/logs/ppo_logs",
+        device="cpu"
     )
 else:
     # --- Train new model ---
-    # MlpPolicy = Multilayer Perceptron (i.e., a fully connected feedforward neural network)
+    # MlpLtsmPolicy = Multilayer Perceptron (i.e., a fully connected feedforward neural network)
     # verbose=1: This turns on basic logging output, which prints training information (episode rewards, losses, etc.) to the console during training.
     # tensorboard_log="./ppo_logs": This logs training metrics (e.g., rewards, losses, episode lengths) to a directory called ppo_logs/ for use with TensorBoard — a tool for visualizing training progress over time.
-    model = PPO(
-        "MlpPolicy",
-        env,
-        verbose=1,
-        tensorboard_log="../ppo_logs",
-        device="cpu",
-        learning_rate=1e-5,
-        policy_kwargs={"max_grad_norm": 0.5}
-    )
+    model = RecurrentPPO("MlpLstmPolicy", env, **ppo_config)
 
 # --- Set up checkpointing ---
 checkpoint = CheckpointCallback(
-    save_freq=10_000, save_path="/home/jarred/git/ServoTrader/models/", name_prefix="ppo_servo_trader"
+    save_freq=100_000, save_path="/home/jarred/git/ServoTrader/models/", name_prefix="ppo_servo_trader"
 )
 
 # --- Train model ---
 model.learn(total_timesteps=1_000_000, callback=checkpoint)
+
+print(f"[TensorBoard] Logs saved to: {ppo_config['tensorboard_log']}") # Check where the logs are going
+
+# --- Log the final results ---
+with open(env.envs[0].env.log_path, "a") as f:
+    f.write(f"=== Training Complete ===\n")
+    f.write(f"Total Episodes: {env.envs[0].env.episode_counter}\n")
+    f.write(f"Total Return: {env.envs[0].env.total_profit_percent:.2f}%\n")
 
 # --- Save final model ---
 model.save("/home/jarred/git/ServoTrader/models/ppo_servo_trader")
