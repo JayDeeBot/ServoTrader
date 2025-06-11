@@ -15,7 +15,9 @@ Features:
 
 Usage:
 - Set CONTINUE_TRAINING to True to resume from a saved model
-- Run `tensorboard --logdir ../ppo_logs` to visualize training
+- Run the script '/bin/python3.11 /home/jarred/git/ServoTrader/scripts/train_ppo_agent.py'
+- Run `tensorboard --logdir /home/jarred/git/ServoTrader/logs --port 6006` to visualize training
+- To view logs go to '[http://localhost:6006](http://localhost:6006)'
 
 Author: Jarred Deluca  
 Project: ServoTrader  
@@ -23,7 +25,6 @@ License: MIT
 """
 
 # scripts/train_ppo_agent.py
-# python scripts/train_ppo_agent.py
 
 import sys
 import os
@@ -96,7 +97,7 @@ ppo_config = {
     "normalize_advantage": True,
     "device": "cpu",
     "verbose": 1,
-    "tensorboard_log": "/home/jarred/git/ServoTrader/logs/ppo_logs"
+    "tensorboard_log": "/home/jarred/git/ServoTrader/logs"
 }
 
 # --- Set this flag to True if continuing training ---
@@ -107,7 +108,7 @@ if CONTINUE_TRAINING:
     model = RecurrentPPO.load(
         "/home/jarred/git/ServoTrader/models/ppo_servo_trader",
         env=env,
-        tensorboard_log="/home/jarred/git/ServoTrader/logs/ppo_logs",
+        tensorboard_log="/home/jarred/git/ServoTrader/logs",
         device="cpu"
     )
 else:
@@ -123,7 +124,7 @@ checkpoint = CheckpointCallback(
 )
 
 # --- Train model ---
-model.learn(total_timesteps=1_000_000, callback=checkpoint)
+model.learn(total_timesteps=500_000, callback=checkpoint)
 
 print(f"[TensorBoard] Logs saved to: {ppo_config['tensorboard_log']}") # Check where the logs are going
 

@@ -66,7 +66,7 @@ class CryptoTradingEnv(gym.Env):
         self.cash_balance = 1.0  # Start with $1.00 virtual capital
         self.portfolio_value = self.cash_balance # Total portfolio value at each time step
         self.break_even_steps = 0 # Member to track how long we've been near break-even after a buy has been made
-        self.history_window = 10  # Number of past timesteps to include in observation
+        self.history_window = 5  # Number of past timesteps to include in observation
 
         # Store symbol list, preprocess raw dataframe
         self.crypto_codes = sorted(crypto_codes)
@@ -92,10 +92,10 @@ class CryptoTradingEnv(gym.Env):
         self.observation_space = spaces.Box(low=low, high=high, dtype=np.float32)
 
         # Internal Logging
-        self.log_dir = "/home/jarred/git/ServoTrader/servo_trader/env_logs" # Directory containing the log
+        self.log_dir = "/home/jarred/git/ServoTrader/logs" # Directory containing the log
         os.makedirs(self.log_dir, exist_ok=True) # Ensure the log exists
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S") # Record the start datetime
-        self.log_path = os.path.join(self.log_dir, f"training_log_{timestamp}.txt") # Create a text file for the log
+        self.log_path = os.path.join(self.log_dir, f"env_log_{timestamp}.txt") # Create a text file for the log
         self.episode_log = []  # Will hold step-level logs temporarily
         self.total_profit_percent = 0  # For global tracking of the profit
         self.episode_counter = 0 # Stores the episode count
@@ -331,57 +331,57 @@ class CryptoTradingEnv(gym.Env):
         terminated = done # Terminated & done will be the same for our application
         truncated = (self.current_step - self.start_index) >= self.timeout_steps # Truncated is true if the total steps of the episode exceeds the timeout steps
         info = {}
-        # # Log the reason the episode ended
-        # if terminated:
-        #     if truncated:
-        #         print(f"[Env] Episode ended due to timeout at step {self.current_step - self.start_index} (relative to episode start)")
-        #     else:
-        #         print(f"[Env] Episode terminated due to sell at step {self.current_step - self.start_index} (relative to episode start)")
+        # Log the reason the episode ended
+        if terminated:
+            if truncated:
+                print(f"[Env] Episode ended due to timeout at step {self.current_step - self.start_index} (relative to episode start)")
+            else:
+                print(f"[Env] Episode terminated due to sell at step {self.current_step - self.start_index} (relative to episode start)")
         
-        # # Log the behavior at the current step
-        # if self.active_crypto_index is not None: # Check if we are holding a crypto
-        #     current_price = self.data[self.current_step, self.active_crypto_index, 3] # Grab the current price of the crypto held
-        #     if self.buy_price != 0: # If it is not 0, safeguard against dividing by 0
-        #         profit = (current_price - self.buy_price) / self.buy_price * 100 # Calculate the current profit
-        #     else: # If it is 0 profit must be 0
-        #         profit = 0
-        # else: # If we are not holding a crypto the current price & profit must be null
-        #     current_price = None
-        #     profit = None
+        # Log the behavior at the current step
+        if self.active_crypto_index is not None: # Check if we are holding a crypto
+            current_price = self.data[self.current_step, self.active_crypto_index, 3] # Grab the current price of the crypto held
+            if self.buy_price != 0: # If it is not 0, safeguard against dividing by 0
+                profit = (current_price - self.buy_price) / self.buy_price * 100 # Calculate the current profit
+            else: # If it is 0 profit must be 0
+                profit = 0
+        else: # If we are not holding a crypto the current price & profit must be null
+            current_price = None
+            profit = None
 
-        # action_name = ( # Record the action at the current step
-        #     "Hold" if action == 0 else
-        #     "Sell" if action == self.num_cryptos + 1 else
-        #     f"Buy {self.crypto_codes[action - 1]}"
-        # )
-        # # Record in our episode log
-        # profit_str = f"{profit:.2f}%" if profit is not None else "N/A" # Safety check - ensure profit is a string
-        # price_str = f"{current_price:.4f}" if current_price is not None else "N/A" # Safety check - ensure price is a string
-        # self.episode_log.append(
-        #     f"Step {self.current_step - self.start_index}: Action={action_name}, Price={price_str}, Profit={profit_str}, Reward={reward:.2f}"
-        # )
+        action_name = ( # Record the action at the current step
+            "Hold" if action == 0 else
+            "Sell" if action == self.num_cryptos + 1 else
+            f"Buy {self.crypto_codes[action - 1]}"
+        )
+        # Record in our episode log
+        profit_str = f"{profit:.2f}%" if profit is not None else "N/A" # Safety check - ensure profit is a string
+        price_str = f"{current_price:.4f}" if current_price is not None else "N/A" # Safety check - ensure price is a string
+        self.episode_log.append(
+            f"Step {self.current_step - self.start_index}: Action={action_name}, Price={price_str}, Profit={profit_str}, Reward={reward:.2f}"
+        )
 
-        # # Log summary when episode is complete
-        # if done: # If the episode is complete log
-        #     self.episode_counter += 1 # Increment the episode counter up
-        #     episode_steps = self.current_step - self.start_index # Calculate the total steps of this episode
-        #     percent_return = (self.portfolio_value - 1.0) * 100  # Calcuate the percentage return - we start each ep with $1
-        #     self.total_profit_percent += percent_return # Save the total_profit_percent (through all eps in this session)
+        # Log summary when episode is complete
+        if done: # If the episode is complete log
+            self.episode_counter += 1 # Increment the episode counter up
+            episode_steps = self.current_step - self.start_index # Calculate the total steps of this episode
+            percent_return = (self.portfolio_value - 1.0) * 100  # Calcuate the percentage return - we start each ep with $1
+            self.total_profit_percent += percent_return # Save the total_profit_percent (through all eps in this session)
 
-        #     # Log the summary
-        #     self.episode_log.append(f"--- Episode {self.episode_counter} Summary ---")
-        #     self.episode_log.append(f"Steps: {episode_steps}")
-        #     self.episode_log.append(f"Final Portfolio Value: ${self.portfolio_value:.4f}")
-        #     self.episode_log.append(f"Episode Return: {percent_return:.2f}%")
-        #     self.episode_log.append(f"Final Reward: {reward:.2f}")
-        #     self.episode_log.append(f"Termination: {'timeout' if truncated else 'sell'}")
-        #     self.episode_log.append("")
+            # Log the summary
+            self.episode_log.append(f"--- Episode {self.episode_counter} Summary ---")
+            self.episode_log.append(f"Steps: {episode_steps}")
+            self.episode_log.append(f"Final Portfolio Value: ${self.portfolio_value:.4f}")
+            self.episode_log.append(f"Episode Return: {percent_return:.2f}%")
+            self.episode_log.append(f"Final Reward: {reward:.2f}")
+            self.episode_log.append(f"Termination: {'timeout' if truncated else 'sell'}")
+            self.episode_log.append("")
 
-        #     # Write to file
-        #     with open(self.log_path, "a") as f:
-        #         f.write("\n".join(self.episode_log) + "\n\n")
+            # Write to file
+            with open(self.log_path, "a") as f:
+                f.write("\n".join(self.episode_log) + "\n\n")
             
-        #     self.episode_log = []  # Clear for next episode
+            self.episode_log = []  # Clear for next episode
 
         return obs, reward, terminated, truncated, info # Return the current observation, current/total reward & done flag
 

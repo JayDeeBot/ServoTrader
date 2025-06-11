@@ -25,6 +25,9 @@ Usage:
         def execute_sell(self, symbol, fractional_qty): ...
         def cancel_order(self, order_id): ...
         def get_order_by_id(self, order_id): ...
+        def get_saleable_quantity(self, symbol): ...
+        def round_step_size(quantity, step_size): ...
+        def _load_step_sizes(self): ...
 
 Author: Jarred Deluca
 Project: ServoCrypto
@@ -32,6 +35,7 @@ Created: 2025-06-07
 """
 
 from abc import ABC, abstractmethod
+from decimal import Decimal, ROUND_DOWN, getcontext
 
 class ServoTraderInterface(ABC):
     """
@@ -108,3 +112,44 @@ class ServoTraderInterface(ABC):
             Any: A platform-specific order object or status dictionary.
         """
         pass
+
+    @abstractmethod
+    def get_saleable_quantity(self, symbol: str) -> float:
+        """
+        Calculate the amount of a given crypto symbol that is currently saleable,
+        rounded to meet exchange constraints (e.g., step size).
+
+        Args:
+            symbol (str): The crypto trading symbol (e.g., 'BTCUSDT').
+
+        Returns:
+            float: The valid, saleable quantity of the crypto asset.
+        """
+        pass
+    
+    @abstractmethod
+    def _load_step_sizes(self):
+        """
+        Preload step sizes for all tradeable symbols.
+        Returns:
+            dict: A mapping of symbols to their step sizes.
+        """
+        pass
+
+    @staticmethod
+    def round_step_size(quantity, step_size):
+        """
+        Rounds a quantity down to the nearest allowed step size.
+
+        Args:
+            quantity (float): The amount to round.
+            step_size (str): The step size as a string, e.g., '0.00000001'.
+
+        Returns:
+            float: The rounded quantity.
+        """
+        getcontext().prec = 20  # ensure precision
+        quantity = Decimal(str(quantity))
+        step_size = Decimal(str(step_size))
+        rounded = (quantity // step_size) * step_size  # floor to step multiple
+        return float(rounded)
