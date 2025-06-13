@@ -1,0 +1,25 @@
+[project]
+name = "servo_trader"
+version = "0.1.0"
+description = "Automated crypto trading bot that uses regression models to predict growth and execute limit trades"
+authors = [
+    { name = "Jarred Deluca", email = "jarred.g.deluca@student.uts.edu.au" }
+]
+license = { text = "MIT" }
+readme = "README.md"
+requires-python = ">=3.8"
+
+dependencies = [
+    "pandas",
+    "numpy",
+    "requests",
+    "scikit-learn",
+    "xgboost",
+    "catboost",
+    "pyyaml",
+    "python-binance",
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"

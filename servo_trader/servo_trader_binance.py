@@ -212,13 +212,13 @@ class ServoTraderBinance(ServoTraderInterface):
         Return the saleable quantity for a given symbol, rounded to step size.
         """
         try:
-            asset = symbol.replace("USDT", "")  # crude parsing
-            raw_qty = self.portfolio.get(asset, {}).get("qty", 0.0)
-            step_size = self.step_sizes.get(symbol, '0.00000001')  # fallback
-            rounded_qty = self.round_step_size(raw_qty, step_size)
+            asset = symbol.replace("USDT", "")  # Attempt to isolate base asset name by stripping "USDT" from the symbol
+            raw_qty = self.portfolio.get(asset, {}).get("qty", 0.0) # Lookup the base asset qty in our portfolio dictionary
+            step_size = self.step_sizes.get(symbol, '0.00000001')  # Grab the step size for the given trading pair - fallback to 0.00000001 if not found
+            rounded_qty = self.round_step_size(raw_qty, step_size) # Round down the raw qty to the nearest multiple of the step size
 
             print(f"[Debug] Raw qty: {raw_qty}, Step size: {step_size}, Rounded: {rounded_qty}")
-            return rounded_qty
+            return rounded_qty # Return the rounded qty
         except Exception as e:
-            print(f"{self.RED_COLOR}Error calculating saleable quantity for {symbol}: {e}{self.RESET_COLOR}")
-            return 0.0
+            print(f"{self.RED_COLOR}Error calculating saleable quantity for {symbol}: {e}{self.RESET_COLOR}") # Report error
+            return 0.0 # Return 0.0 if there is an error

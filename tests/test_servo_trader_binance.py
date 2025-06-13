@@ -1,3 +1,42 @@
+"""
+test_servo_trader_binance.py
+
+Test Case: Live Binance API Integration for ServoTraderBinance
+
+This test script performs a functional check of the ServoTraderBinance class by interacting
+with the Binance API using real API credentials. It validates account access, portfolio 
+retrieval, cash balance reporting, and optionally live trading actions such as market buys, 
+market sells, and limit order management.
+
+Test Scope:
+-----------
+1. ✅ Retrieve and print current crypto holdings (quantities + value).
+2. ✅ Retrieve and display current USDT cash balance.
+3. ✅ Execute a market sell order and retrieve its order status.
+4. ⚠️ Optional: Execute a market buy order and check its status.
+5. ⚠️ Optional: Place and cancel limit buy/sell orders to test order management functions.
+
+Instructions:
+-------------
+- Insert your Binance API and Secret Key at the top (use `.env` or secure method in production).
+- Run the script directly or as a module:
+    $ /bin/python3.11 -m tests.test_servo_trader_binance
+
+⚠️ Warnings:
+------------
+- This script may execute real trades on your Binance account.
+- Only uncomment trade-related sections when you're sure your test account can safely execute them.
+- Use tiny quantities (e.g., 0.0001 BTC) for limit order testing to avoid financial loss.
+
+Environment Requirements:
+-------------------------
+- Binance API credentials
+- Network access to https://api.binance.com
+- `python-binance` package installed
+- servo_trader/servo_trader_binance.py class properly implemented
+
+"""
+
 # tests/test_servo_trader_binance.py
 # /bin/python3.11 -m tests.test_servo_trader_binance
 
