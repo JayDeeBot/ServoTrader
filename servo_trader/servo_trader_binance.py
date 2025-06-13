@@ -30,6 +30,7 @@ Created: 2025-06-07
 from binance.client import Client # Import the binance API
 from .servo_trader_interface import ServoTraderInterface # Import the parent class (trading interface)
 import time
+import yaml
 
 class ServoTraderBinance(ServoTraderInterface):
     """
@@ -40,15 +41,27 @@ class ServoTraderBinance(ServoTraderInterface):
     RED_COLOR = "\033[91m"
     RESET_COLOR = "\033[0m"
 
-    def __init__(self, api_key: str, secret_key: str):
+    def __init__(self, params_path: str = "/home/jarred/git/ServoTrader/servo_trader/config/params.yaml"):
         """
         Constructor for the trader object.
         Initialises the client for connection to Binance, fetched the current portfolio and current cash balance.
 
         Args:
-            api_key (str): Binance unique api key for users account
-            secret_key (str): Binance unique secret key for users account
+            params_path (str): Path to the params YAML file (default: params.yaml)
         """
+        # Load YAML parameters
+        try:
+            with open(params_path, 'r') as file:
+                params = yaml.safe_load(file)
+        except Exception as e:
+            raise RuntimeError(f"Failed to load params from {params_path}: {e}")
+        
+        # Retrieve API credentials
+        api_key = params.get("BINANCE_API_KEY")
+        secret_key = params.get("BINANCE_SECRET_KEY")
+        if not api_key or not secret_key:
+            raise ValueError("BINANCE_API_KEY and BINANCE_SECRET_KEY must be provided in params.yaml.")
+        
         self.client = Client(api_key, secret_key) # Init the API Client - connection to binance
         self.portfolio = self.get_portfolio() # Fetch the current portfolio - all positions
         self.cash_balance = self.get_cash_balance() # Fetch the current cash balance

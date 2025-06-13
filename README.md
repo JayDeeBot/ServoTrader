@@ -63,8 +63,8 @@ poetry install
 2. Add your API keys to `main.py` (or use environment variables for security):
 
 ```python
-API_KEY = "your_alpaca_key"
-SECRET_KEY = "your_alpaca_secret"
+API_KEY = "your_binance_key"
+SECRET_KEY = "your_binance_secret"
 ```
 
 3. Run the bot:

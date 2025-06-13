@@ -44,15 +44,11 @@ import sys
 import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from servo_trader.servo_trader_binance import ServoTraderBinance
-import time
-
-# Replace with your actual keys or load them securely (e.g., from .env)
-API_KEY = "6BZOFxkzIau3dqljZu8tbbKY5tZxnptRJkOfHq6Nx5jZDbvogxseqFkaQ3RnuaBE"
-SECRET_KEY = "6vguZphjUuW9t6SdPZUxImWNzB2anPr91jAWHw9dwIASLeFAVnbQQMZi0iZVBdru"
 
 def main():
+
     print("Initializing ServoTraderBinance...")
-    trader = ServoTraderBinance(api_key=API_KEY, secret_key=SECRET_KEY)
+    trader = ServoTraderBinance(params_path="/home/jarred/git/ServoTrader/servo_trader/config/params.yaml")
 
     ### --- PORTFOLIO/BALANCE RETRIEVAL TESTING --- ###
 
@@ -60,7 +56,7 @@ def main():
     print("\n📦 Portfolio:")
     portfolio = trader.get_portfolio()
     for symbol, data in portfolio.items():
-        print(f"{symbol}: Qty = {data['qty']}, Value = {data['value']}")
+        print(f"{symbol}: Qty = {data['qty']}")
 
     # Check your cash balance
     print("\n💰 Cash Balance:")
@@ -85,16 +81,16 @@ def main():
 
     # ### --- SELL ORDER TESTING --- ###
 
-    # Make a sell order
-    print("\n💸 Testing Market Sell Order:")
-    saleable_qty = trader.get_saleable_quantity("BTCUSDT") # Caculate the highest qty we can sell
-    print(f"Saleable BTC: {saleable_qty}")
-    sell_order_id = trader.execute_sell("BTCUSDT", saleable_qty) # Sell the crypto and save the ID
-    print(f"Sell Order ID: {sell_order_id}")
+    # # Make a sell order
+    # print("\n💸 Testing Market Sell Order:")
+    # saleable_qty = trader.get_saleable_quantity("BTCUSDT") # Caculate the highest qty we can sell
+    # print(f"Saleable BTC: {saleable_qty}")
+    # sell_order_id = trader.execute_sell("BTCUSDT", saleable_qty) # Sell the crypto and save the ID
+    # print(f"Sell Order ID: {sell_order_id}")
 
-    # Check the status of your sell order
-    print("\n🛑 Testing Sell Order Status Retrieval:")
-    trader.get_order_by_id(sell_order_id) # Check the sell order status
+    # # Check the status of your sell order
+    # print("\n🛑 Testing Sell Order Status Retrieval:")
+    # trader.get_order_by_id(sell_order_id) # Check the sell order status
 
     ### -- CANCEL ORDER TESTING --- ###
 
