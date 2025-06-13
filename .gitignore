@@ -1,0 +1,39 @@
+# === Python Cache & Build ===
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+*.egg-info/
+build/
+dist/
+
+# === OS-Specific ===
+.DS_Store
+Thumbs.db
+
+# === Editor Configs ===
+.vscode/
+.idea/
+
+# === Logs, Models, Raw Data ===
+/data/                      # Raw CSVs and downloaded market data
+/logs/                      # PPO training logs and environment logs
+/models/                    # Saved PPO model checkpoints and artifacts
+/servo_trader/config/       # Runtime-specific or machine-local configs
+
+# === Environment & Secrets ===
+.env
+.venv/
+env/
+venv/
+*.env
+
+# === Output Artifacts ===
+*.csv
+*.json
+*.yaml
+*.log
+*.txt
+*.h5
+*.npy
+*.pkl

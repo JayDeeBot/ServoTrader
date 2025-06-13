@@ -105,7 +105,7 @@ CONTINUE_TRAINING = False
 
 if CONTINUE_TRAINING:
     # --- Load existing model ---
-    model = RecurrentPPO.load(
+    model = MaskablePPO.load(
         "/home/jarred/git/ServoTrader/models/ppo_servo_trader",
         env=env,
         tensorboard_log="/home/jarred/git/ServoTrader/logs",
@@ -113,10 +113,10 @@ if CONTINUE_TRAINING:
     )
 else:
     # --- Train new model ---
-    # MlpLtsmPolicy = Multilayer Perceptron (i.e., a fully connected feedforward neural network)
+    # MlpLstmPolicy = Multilayer Perceptron (i.e., a fully connected feedforward neural network)
     # verbose=1: This turns on basic logging output, which prints training information (episode rewards, losses, etc.) to the console during training.
     # tensorboard_log="./ppo_logs": This logs training metrics (e.g., rewards, losses, episode lengths) to a directory called ppo_logs/ for use with TensorBoard — a tool for visualizing training progress over time.
-    model = RecurrentPPO("MlpLstmPolicy", env, **ppo_config)
+    model = MaskablePPO("MlpPolicy", env, **ppo_config)
 
 # --- Set up checkpointing ---
 checkpoint = CheckpointCallback(

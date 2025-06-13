@@ -332,11 +332,11 @@ class CryptoTradingEnv(gym.Env):
         truncated = (self.current_step - self.start_index) >= self.timeout_steps # Truncated is true if the total steps of the episode exceeds the timeout steps
         info = {}
         # Log the reason the episode ended
-        if terminated:
-            if truncated:
-                print(f"[Env] Episode ended due to timeout at step {self.current_step - self.start_index} (relative to episode start)")
-            else:
-                print(f"[Env] Episode terminated due to sell at step {self.current_step - self.start_index} (relative to episode start)")
+        # if terminated:
+        #     if truncated:
+        #         print(f"[Env] Episode ended due to timeout at step {self.current_step - self.start_index} (relative to episode start)")
+        #     else:
+        #         print(f"[Env] Episode terminated due to sell at step {self.current_step - self.start_index} (relative to episode start)")
         
         # Log the behavior at the current step
         if self.active_crypto_index is not None: # Check if we are holding a crypto
