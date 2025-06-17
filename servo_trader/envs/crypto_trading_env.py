@@ -37,6 +37,7 @@ import numpy as np
 import pandas as pd
 import os
 from datetime import datetime
+import json
 
 class CryptoTradingEnv(gym.Env):
     """
@@ -45,7 +46,7 @@ class CryptoTradingEnv(gym.Env):
     metadata = {'render.modes': ['human']}
 
     
-    def __init__(self, data, crypto_codes, episode_timeout=15):
+    def __init__(self, data, crypto_codes, episode_timeout=15, raw_csv_path=None):
         super(CryptoTradingEnv, self).__init__()
         """
         Constructor for CryptoTradingEnvironemnt.
@@ -56,7 +57,14 @@ class CryptoTradingEnv(gym.Env):
             episode_timeout: max steps possible before each episode times out
         """
 
-        self.data = data # Historical Data used for training
+        self.data = data # Historical Data used for training 
+        self.raw_df = data.copy() # Save a raw copy of the historical data for logging
+        # Pre process raw data for logging
+        self.raw_df["symbol"] = self.raw_df["symbol"].str.strip()
+        self.raw_lookup = {
+            sym: df.reset_index(drop=True)
+            for sym, df in self.raw_df.groupby("symbol")
+        }
         self.crypto_codes = crypto_codes # Codes for the 100 Cryptos we are observing
         self.timeout_steps = episode_timeout # The maximum length in minutes that an episode will be allowed
         self.current_step = 0 # Time step of the current episode
@@ -95,7 +103,7 @@ class CryptoTradingEnv(gym.Env):
         self.log_dir = "/home/jarred/git/ServoTrader/logs" # Directory containing the log
         os.makedirs(self.log_dir, exist_ok=True) # Ensure the log exists
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S") # Record the start datetime
-        self.log_path = os.path.join(self.log_dir, f"env_log_{timestamp}.txt") # Create a text file for the log
+        self.log_path = os.path.join(self.log_dir, f"env_log_{timestamp}.jsonl") # Create a jsonl file for the log
         self.episode_log = []  # Will hold step-level logs temporarily
         self.total_profit_percent = 0  # For global tracking of the profit
         self.episode_counter = 0 # Stores the episode count
@@ -187,6 +195,16 @@ class CryptoTradingEnv(gym.Env):
         self.buy_price = 0.0 # Reset the buy price to 0
         self.cash_balance = 1.0 # Reset the cash balance to 1
         self.portfolio_value = 1.0 # Reset the portfolio value to 1
+
+        # --- Log episode start step in structured JSON ---
+        episode_record = {
+            "type": "episode_start",
+            "episode": int(self.episode_counter + 1),   # Convert to native int
+            "start_step": int(self.start_index),        # Native int for step index
+            "timestamp": datetime.now().isoformat()     # ISO timestamp string
+        }
+        self.episode_log.append(episode_record)        # Append to buffer for later writing
+
         return self._get_observation(), {} # Return the initial observation - observation at the current step
 
     def _get_observation(self):
@@ -337,51 +355,103 @@ class CryptoTradingEnv(gym.Env):
         #         print(f"[Env] Episode ended due to timeout at step {self.current_step - self.start_index} (relative to episode start)")
         #     else:
         #         print(f"[Env] Episode terminated due to sell at step {self.current_step - self.start_index} (relative to episode start)")
-        
-        # Log the behavior at the current step
-        if self.active_crypto_index is not None: # Check if we are holding a crypto
-            current_price = self.data[self.current_step, self.active_crypto_index, 3] # Grab the current price of the crypto held
-            if self.buy_price != 0: # If it is not 0, safeguard against dividing by 0
-                profit = (current_price - self.buy_price) / self.buy_price * 100 # Calculate the current profit
-            else: # If it is 0 profit must be 0
-                profit = 0
-        else: # If we are not holding a crypto the current price & profit must be null
-            current_price = None
-            profit = None
 
-        action_name = ( # Record the action at the current step
-            "Hold" if action == 0 else
-            "Sell" if action == self.num_cryptos + 1 else
-            f"Buy {self.crypto_codes[action - 1]}"
-        )
-        # Record in our episode log
-        profit_str = f"{profit:.2f}%" if profit is not None else "N/A" # Safety check - ensure profit is a string
-        price_str = f"{current_price:.4f}" if current_price is not None else "N/A" # Safety check - ensure price is a string
-        self.episode_log.append(
-            f"Step {self.current_step - self.start_index}: Action={action_name}, Price={price_str}, Profit={profit_str}, Reward={reward:.2f}"
-        )
+        # --- Log the behavior at the current step in structured JSON ---
+        step_offset = int(self.current_step - self.start_index)  # Ensure it's native int for JSON
 
-        # Log summary when episode is complete
-        if done: # If the episode is complete log
-            self.episode_counter += 1 # Increment the episode counter up
-            episode_steps = self.current_step - self.start_index # Calculate the total steps of this episode
-            percent_return = (self.portfolio_value - 1.0) * 100  # Calcuate the percentage return - we start each ep with $1
-            self.total_profit_percent += percent_return # Save the total_profit_percent (through all eps in this session)
+        # Initialize placeholders for price/profit values
+        current_price = None       # Normalized close price
+        profit = None              # Profit percentage
+        raw_price = None           # Raw close price
+        raw_buy_price = None       # Buy price from raw data
+        raw_sell_price = None      # Sell price from raw data
 
-            # Log the summary
-            self.episode_log.append(f"--- Episode {self.episode_counter} Summary ---")
-            self.episode_log.append(f"Steps: {episode_steps}")
-            self.episode_log.append(f"Final Portfolio Value: ${self.portfolio_value:.4f}")
-            self.episode_log.append(f"Episode Return: {percent_return:.2f}%")
-            self.episode_log.append(f"Final Reward: {reward:.2f}")
-            self.episode_log.append(f"Termination: {'timeout' if truncated else 'sell'}")
-            self.episode_log.append("")
+        # If currently holding a crypto, compute prices and profit
+        if self.active_crypto_index is not None:
+            current_price = float(self.data[self.current_step, self.active_crypto_index, 3])  # Normalized close
+            profit = ((current_price - self.buy_price) / self.buy_price) * 100 if self.buy_price else 0.0
+            symbol = self.crypto_codes[self.active_crypto_index]
+            if symbol in self.raw_lookup:
+                raw_price = float(self.raw_lookup[symbol].iloc[self.current_step]["close"])  # Raw close price
 
-            # Write to file
+        # Create the base JSON record for this step
+        step_event = {
+            "type": "step",
+            "offset": step_offset,
+            "action": int(action),  # Ensure action is native int
+            "reward": float(reward)
+        }
+
+        # Add price and symbol info if holding a position
+        if self.active_crypto_index is not None:
+            step_event["symbol"] = symbol
+            step_event["price"] = raw_price if raw_price is not None else current_price
+            step_event["profit_pct"] = float(profit)
+
+        # --- BUY action logging ---
+        if 1 <= action <= self.num_cryptos:
+            buy_symbol = self.crypto_codes[action - 1]
+            if buy_symbol in self.raw_lookup:
+                raw_buy_price = float(self.raw_lookup[buy_symbol].iloc[self.current_step]["close"])
+            step_event["action_type"] = "buy"
+            step_event["symbol"] = buy_symbol
+            step_event["price"] = raw_buy_price if raw_buy_price is not None else float(self.buy_price)
+
+        # --- SELL action logging ---
+        elif action == self.num_cryptos + 1 and hasattr(self, "_last_sell_context"):
+            ctx = self._last_sell_context
+            sell_symbol = ctx["symbol"]
+            if sell_symbol in self.raw_lookup:
+                raw_sell_price = float(self.raw_lookup[sell_symbol].iloc[self.current_step]["close"])
+            step_event["action_type"] = "sell"
+            step_event["symbol"] = sell_symbol
+            step_event["buy_price"] = float(ctx["buy_price"])
+            step_event["sell_price"] = raw_sell_price if raw_sell_price is not None else float(ctx["sell_price"])
+            step_event["profit_pct"] = float(ctx["profit"])
+            del self._last_sell_context  # Cleanup context after logging
+
+        # --- HOLD or fallback logging ---
+        else:
+            step_event["action_type"] = "hold" if action == 0 else "unknown"
+
+        # --- Add raw_index for test alignment ---
+        if step_event.get("symbol") and step_event["symbol"] in self.raw_lookup:
+            raw_idx = int(self.raw_lookup[step_event["symbol"]].index[self.current_step])
+            step_event["raw_index"] = raw_idx
+
+        # Append the structured step log
+        self.episode_log.append(step_event)
+
+        # --- At episode end, log summary ---
+        if done:
+            self.episode_counter += 1
+            episode_steps = int(self.current_step - self.start_index)
+            percent_return = float((self.portfolio_value - 1.0) * 100)
+            self.total_profit_percent += percent_return
+
+            summary = {
+                "type": "episode_end",
+                "episode": self.episode_counter,
+                "steps": episode_steps,
+                "final_value": float(self.portfolio_value),
+                "episode_return_pct": percent_return,
+                "termination": "timeout" if truncated else "sell",
+                "timestamp": datetime.now().isoformat()
+            }
+
+            if self.raw_df is not None and self.active_crypto_index is not None:
+                final_sym = self.crypto_codes[self.active_crypto_index]
+                if final_sym in self.raw_lookup:
+                    summary["final_raw_close"] = float(self.raw_lookup[final_sym].iloc[self.current_step]["close"])
+
+            self.episode_log.append(summary)
+
+            # Persist JSONL to disk
             with open(self.log_path, "a") as f:
-                f.write("\n".join(self.episode_log) + "\n\n")
-            
-            self.episode_log = []  # Clear for next episode
+                for record in self.episode_log:
+                    f.write(json.dumps(record) + "\n")
+
+            self.episode_log = []  # Clear buffer for next episode
 
         return obs, reward, terminated, truncated, info # Return the current observation, current/total reward & done flag
 
@@ -449,6 +519,18 @@ class CryptoTradingEnv(gym.Env):
             buy price
             cash balance
         """
+        # Save sell log data before resetting state
+        if self.active_crypto_index is not None:
+            self._last_sell_context = {
+                "symbol": self.crypto_codes[self.active_crypto_index],
+                "buy_price": self.buy_price,
+                "sell_price": self.data[self.current_step, self.active_crypto_index, 3],
+                "profit": (
+                    (self.data[self.current_step, self.active_crypto_index, 3] - self.buy_price)
+                    / self.buy_price * 100 if self.buy_price else 0
+                )
+            }
+
         self.active_crypto_index = None
         self.buy_price = 0.0
         self.cash_balance = self.portfolio_value
@@ -479,7 +561,7 @@ class CryptoTradingEnv(gym.Env):
             A panda series of close-prices with length: [window]
         """
         if self.active_crypto_index is None or self.current_step < window: # If there is an active crypto purchased or the current step is within the window
-            return None # Return nohting
+            return None # Return nothing
         return pd.Series(
             self.data[self.current_step - window:self.current_step, self.active_crypto_index, 3]
         ) # Return the close-prices of the active crypto over the given window

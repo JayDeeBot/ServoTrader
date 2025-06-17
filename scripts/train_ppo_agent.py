@@ -32,6 +32,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import pandas as pd
 import json
+from datetime import datetime
 import numpy as np
 from stable_baselines3 import PPO # Import the PPO (Proximal Policy Optimization algorithm) Agent
 from stable_baselines3.common.vec_env import DummyVecEnv 
@@ -124,15 +125,42 @@ checkpoint = CheckpointCallback(
 )
 
 # --- Train model ---
-model.learn(total_timesteps=500_000, callback=checkpoint)
+model.learn(total_timesteps=5000, callback=checkpoint)
+
+# Save the total number of timesteps completed during training
+actual_timesteps = model.num_timesteps  # Real number of steps — could be > 5000 due to n_steps batch rounding
+simulated_minutes = actual_timesteps  # Since each step = 1 minute in your env
+simulated_days = simulated_minutes / (60 * 24) # Compute how many trading days were simulated
 
 print(f"[TensorBoard] Logs saved to: {ppo_config['tensorboard_log']}") # Check where the logs are going
 
-# --- Log the final results ---
-with open(env.envs[0].env.log_path, "a") as f:
-    f.write(f"=== Training Complete ===\n")
-    f.write(f"Total Episodes: {env.envs[0].env.episode_counter}\n")
-    f.write(f"Total Return: {env.envs[0].env.total_profit_percent:.2f}%\n")
+# --- Log final training results as JSON ---
+env_instance = env.envs[0].env  # Unwrap the inner CryptoTradingEnv from the VecEnv stack
+
+total_return_pct = float(env_instance.total_profit_percent) # grab the total return
+
+# Geometric (compounded) daily return
+if simulated_days > 0 and total_return_pct > -100:
+    total_growth = 1 + (total_return_pct / 100)
+    daily_growth_factor = total_growth ** (1 / simulated_days)
+    compounded_daily_return_pct = (daily_growth_factor - 1) * 100
+else:
+    compounded_daily_return_pct = 0.0
+
+# Build a structured summary object
+training_summary = {
+    "type": "training_complete",                              # event type
+    "total_episodes": env_instance.episode_counter,           # number of completed episodes
+    "total_return_pct": float(env_instance.total_profit_percent),  # cumulative return (float)
+    "total_timesteps": int(actual_timesteps), # total simulated minutes
+    "simulated_days": simulated_days, # total simulated days
+    "compounded_daily_return_pct": compounded_daily_return_pct,  # compound daily return
+    "timestamp": datetime.now().isoformat()                  # timestamp of training end
+}
+
+# Append this record at the end of the JSONL log
+with open(env_instance.log_path, "a") as f:
+    f.write(json.dumps(training_summary) + "\n\n")
 
 # --- Save final model ---
 model.save("/home/jarred/git/ServoTrader/models/ppo_servo_trader")
