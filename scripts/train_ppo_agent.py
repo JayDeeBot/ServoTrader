@@ -42,6 +42,7 @@ from stable_baselines3.common.monitor import Monitor # Necessary for monitoring 
 from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor
 from sb3_contrib import MaskablePPO, RecurrentPPO
 from sb3_contrib.common.wrappers import ActionMasker
+from wrappers.action_mask_wrapper import LSTMActionMaskWrapper
 
 # --- Load crypto codes ---
 with open('/home/jarred/git/ServoTrader/servo_trader/config/crypto_codes.json') as f:
@@ -50,39 +51,50 @@ with open('/home/jarred/git/ServoTrader/servo_trader/config/crypto_codes.json') 
 # --- Load historical data ---
 historical_df = pd.read_csv('/home/jarred/git/ServoTrader/data/historical_crypto_data.csv')
 
-# --- Define action masks --- This ensures that the legal rules are abided
-def action_masks(env):
-    """
-    Masks the action space to ensure only legal moves are possible.
-
-    Legal moves:
-        - No Crypto Held: Buy actions only (1 to num_cryptos)
-        - Crypto Held: Hold (0) and Sell (num_cryptos + 1)
-
-    Returns:
-        mask (np array [bools]): an array of bools for each possible action, where each false index makes the action not possible.
-    """
-    mask = np.zeros(env.action_space.n, dtype=bool)  # Start all as False
-
-    if env.active_crypto_index is None:
-        # No crypto held → only Buy actions are legal
-        mask[1:env.num_cryptos + 1] = True
-    else:
-        # Crypto held → only Hold and Sell are legal
-        mask[0] = True  # Hold
-        mask[env.num_cryptos + 1] = True  # Sell
-
-    return mask
-
 # --- Create environment ---
-# Wrap the environment with action masking
-env = DummyVecEnv([
-    lambda: ActionMasker(
-        CryptoTradingEnv(data=historical_df, crypto_codes=crypto_codes, episode_timeout=15),
-        action_masks
-    )
-])
-env = VecMonitor(env)
+USE_LSTM = False  # Set to False to use MaskablePPO instead
+
+if USE_LSTM:
+    # --- New method: RecurrentPPO with LSTMActionMaskWrapper ---
+    env = DummyVecEnv([
+        lambda: CryptoTradingEnv(data=historical_df, crypto_codes=crypto_codes, episode_timeout=15)
+    ])
+    env = VecMonitor(env)
+    env.envs[0] = LSTMActionMaskWrapper(env.envs[0], model=None)  # Model injected later
+
+else:
+    # --- Original method: MaskablePPO with ActionMasker ---
+    # Define action masks
+    def action_masks(env):
+        """
+        Masks the action space to ensure only legal moves are possible.
+
+        Legal moves:
+            - No Crypto Held: Buy actions only (1 to num_cryptos)
+            - Crypto Held: Hold (0) and Sell (num_cryptos + 1)
+
+        Returns:
+            mask (np array [bools]): an array of bools for each possible action, where each false index makes the action not possible.
+        """
+        mask = np.zeros(env.action_space.n, dtype=bool)  # Start all as False
+
+        if env.active_crypto_index is None:
+            # No crypto held → only Buy actions are legal
+            mask[1:env.num_cryptos + 1] = True
+        else:
+            # Crypto held → only Hold and Sell are legal
+            mask[0] = True  # Hold
+            mask[env.num_cryptos + 1] = True  # Sell
+
+        return mask
+
+    env = DummyVecEnv([
+        lambda: ActionMasker(
+            CryptoTradingEnv(data=historical_df, crypto_codes=crypto_codes, episode_timeout=15),
+            action_masks
+        )
+    ])
+    env = VecMonitor(env)
 
 # Define PPO hyperparameters
 ppo_config = {
@@ -106,18 +118,23 @@ CONTINUE_TRAINING = False
 
 if CONTINUE_TRAINING:
     # --- Load existing model ---
-    model = MaskablePPO.load(
+    model_cls = RecurrentPPO if USE_LSTM else MaskablePPO
+    model = model_cls.load(
         "/home/jarred/git/ServoTrader/models/ppo_servo_trader",
         env=env,
-        tensorboard_log="/home/jarred/git/ServoTrader/logs",
-        device="cpu"
+        tensorboard_log=ppo_config["tensorboard_log"],
+        device=ppo_config["device"]
     )
 else:
     # --- Train new model ---
-    # MlpLstmPolicy = Multilayer Perceptron (i.e., a fully connected feedforward neural network)
-    # verbose=1: This turns on basic logging output, which prints training information (episode rewards, losses, etc.) to the console during training.
-    # tensorboard_log="./ppo_logs": This logs training metrics (e.g., rewards, losses, episode lengths) to a directory called ppo_logs/ for use with TensorBoard — a tool for visualizing training progress over time.
-    model = MaskablePPO("MlpPolicy", env, **ppo_config)
+    if USE_LSTM:
+        # MlpLstmPolicy = Multilayer Perceptron (i.e., a fully connected feedforward neural network)
+        # verbose=1: This turns on basic logging output, which prints training information (episode rewards, losses, etc.) to the console during training.
+        # tensorboard_log="./ppo_logs": This logs training metrics (e.g., rewards, losses, episode lengths) to a directory called ppo_logs/ for use with TensorBoard — a tool for visualizing training progress over time.
+        model = RecurrentPPO("MlpLstmPolicy", env, **ppo_config)
+        env.envs[0].model = model  # Inject model into wrapper
+    else:
+        model = MaskablePPO("MlpPolicy", env, **ppo_config)
 
 # --- Set up checkpointing ---
 checkpoint = CheckpointCallback(

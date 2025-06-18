@@ -31,6 +31,23 @@ License: MIT
 
 # envs/crypto_trading_env.py
 
+def slope_func(x):
+    """
+    Computes the slope of a linear regression line fitted to the input array `x`.
+
+    This function is intended to be used with pandas `.rolling().apply(...)`
+    to calculate the short-term price trend (i.e., upward or downward movement)
+    over a specified rolling window.
+
+    Args:
+        x (array-like): A 1D array of numeric values (e.g., closing prices)
+
+    Returns:
+        float: The slope of the best-fit line through the data points.
+            Positive slope = upward trend, negative slope = downward trend.
+    """
+    return linregress(np.arange(len(x)), x).slope
+
 import gymnasium as gym
 from gymnasium import spaces # Necessary for specifying valid actions & observations
 import numpy as np
@@ -38,6 +55,7 @@ import pandas as pd
 import os
 from datetime import datetime
 import json
+from scipy.stats import linregress
 
 class CryptoTradingEnv(gym.Env):
     """
@@ -75,6 +93,7 @@ class CryptoTradingEnv(gym.Env):
         self.portfolio_value = self.cash_balance # Total portfolio value at each time step
         self.break_even_steps = 0 # Member to track how long we've been near break-even after a buy has been made
         self.history_window = 5  # Number of past timesteps to include in observation
+        self.feature_window = 10 # Window used for computing additional features when pre-processing data
 
         # Store symbol list, preprocess raw dataframe
         self.crypto_codes = sorted(crypto_codes)
@@ -108,12 +127,18 @@ class CryptoTradingEnv(gym.Env):
         self.total_profit_percent = 0  # For global tracking of the profit
         self.episode_counter = 0 # Stores the episode count
 
-    
     def preprocess_data(self, raw_df):
         """
         Converts the stacked CSV format into a 3D tensor: [timesteps, symbols, features]
         Normalises the features (min/max scaling for price & log min/max scaling for volume/count) 
         & Fills in Na's with forward/backward fill
+        Computes and incorporates the following additional features:
+            - Recent return
+            - Volatility
+            - Price position
+            - Volume surge
+            - Trend slope 
+            - Moving avg
         
         Args: 
             raw_df: The raw crypto data (csv format)
@@ -129,12 +154,13 @@ class CryptoTradingEnv(gym.Env):
         """
         self.crypto_codes = sorted(raw_df['symbol'].unique()) # Sort the crypto codes in acsending order to ensure consistent ordering
         self.num_cryptos = len(self.crypto_codes) # Save the total number of codes
-        self.features_per_crypto = 7 # We have 7 features - Open, High, Low, Close, VWap, Volume & Count
         self.num_timesteps = raw_df.groupby('symbol').size().min() # Ensures all cryptos have equal timesteps — truncates to the shortest to maintain uniform shape
 
-        tensor = np.zeros((self.num_timesteps, self.num_cryptos, self.features_per_crypto), dtype=np.float32) # Preallocate tensor: [timesteps, cryptos, features]
-
         feature_cols = ['open', 'high', 'low', 'close', 'vwap', 'volume', 'count'] # Columns to extracts
+        added_features = ['recent_return', 'volatility', 'price_position', 'volume_surge', 'trend_slope', 'moving_avg'] # Additional features to compute
+        all_features = feature_cols + added_features # Total features (13)
+        self.features_per_crypto = len(all_features) # We have 13 features - Open, High, Low, Close, VWap, Volume & Count (base) + recent return, volatility, price position, volume surge, trend slope, moving avg
+        tensor = np.zeros((self.num_timesteps, self.num_cryptos, self.features_per_crypto), dtype=np.float32) # Preallocate tensor: [timesteps, cryptos, features]
 
         for i, symbol in enumerate(self.crypto_codes): # Loop through each crypto symbol
             df_symbol = raw_df[raw_df['symbol'] == symbol].head(self.num_timesteps) # Select the first N rows for this symbol
@@ -146,6 +172,30 @@ class CryptoTradingEnv(gym.Env):
 
             # Fill volume and count with 0
             df_symbol[['volume', 'count']] = df_symbol[['volume', 'count']].fillna(0)
+
+            # --- Add engineered historical features ---
+            window = self.feature_window
+
+            # 1. Recent return (as percent change over window)
+            df_symbol['recent_return'] = df_symbol['close'].pct_change(periods=window).fillna(0)
+
+            # 2. Historical volatility (std dev over window)
+            df_symbol['volatility'] = df_symbol['close'].rolling(window).std().fillna(0)
+
+            # 3. Price position in recent range
+            high = df_symbol['high'].rolling(window).max()
+            low = df_symbol['low'].rolling(window).min()
+            df_symbol['price_position'] = ((df_symbol['close'] - low) / (high - low + 1e-6)).fillna(0)
+
+            # 4. Volume surge index
+            avg_volume = df_symbol['volume'].rolling(window).mean()
+            df_symbol['volume_surge'] = (df_symbol['volume'] / (avg_volume + 1e-6)).fillna(0)
+
+            # 5. Trend slope (via linear regression)
+            df_symbol['trend_slope'] = df_symbol['close'].rolling(window).apply(slope_func, raw=False).fillna(0)
+
+            # 6. Moving average of close
+            df_symbol['moving_avg'] = df_symbol['close'].rolling(window).mean().bfill()
             
             # --- Min-Max scaling for price features ---
             for col in ['open', 'high', 'low', 'close', 'vwap']: # Loop through price columns
@@ -162,7 +212,15 @@ class CryptoTradingEnv(gym.Env):
                 range_val = max_val - min_val if max_val != min_val else 1.0 # Calculate the logarithmic range - prevent divide-by-zero
                 df_symbol[col] = (df_symbol[col] - min_val) / range_val # Normalise, feature = (log(1 + value) - log_minimum) / log_range
 
-            tensor[:, i, :] = df_symbol.to_numpy() # Fill tensor with normalized data for symbol[i]
+            # Engineered features: min-max scale
+            for col in added_features:
+                min_val, max_val = df_symbol[col].min(), df_symbol[col].max()
+                range_val = max_val - min_val
+                df_symbol[col] = (df_symbol[col] - min_val) / (range_val if range_val != 0 else 1.0)
+
+
+            # Populate the tensor slice for this crypto - Final shape [T, F]
+            tensor[:, i, :] = df_symbol[all_features].to_numpy() # Fill tensor with normalized data and additional features for symbol[i]
 
         return tensor # Return tensor (3 Dimensions) containing all data with shape [Timesteps, Cryptos, Features] and type np Float32
 
@@ -205,7 +263,7 @@ class CryptoTradingEnv(gym.Env):
         }
         self.episode_log.append(episode_record)        # Append to buffer for later writing
 
-        return self._get_observation(), {} # Return the initial observation - observation at the current step
+        return self._get_observation(), {"action_mask": self._get_action_mask()} # Return the initial observation - observation at the current step
 
     def _get_observation(self):
         """
@@ -453,6 +511,16 @@ class CryptoTradingEnv(gym.Env):
 
             self.episode_log = []  # Clear buffer for next episode
 
+        # Compute legal action mask
+        action_mask = np.zeros(self.action_space.n, dtype=bool)
+        if self.active_crypto_index is None:
+            action_mask[1:self.num_cryptos + 1] = True  # Buy actions
+        else:
+            action_mask[0] = True  # Hold
+            action_mask[self.num_cryptos + 1] = True  # Sell
+
+        info["action_mask"] = action_mask
+
         return obs, reward, terminated, truncated, info # Return the current observation, current/total reward & done flag
 
     def _calculate_reward(self, profit, dense=False, price_series=None, trade_executed=False):
@@ -469,40 +537,42 @@ class CryptoTradingEnv(gym.Env):
             reward: Current/total rewards
         """
 
-        # --- Volatility-adjusted Sharpe-style bonus/penalty ---
-        risk_penalty = 0 # Init risk penalty as 0
-        if price_series is not None and len(price_series) >= 10: # If price series is set
-            returns = price_series.pct_change().fillna(0) # Compute the percentage change from one price to the next and convert Na's to 0
-            if returns.dropna().shape[0] > 1: # Calculate the volatility = standard deviation of returns
-                volatility = returns.std()
-            else:
-                volatility = 0 # or some small default like 1e-8 to avoid div-by-zero elsewhere
-            if volatility > 0: # If the volatility if greater than 0
-                sharpe_like = profit / volatility # Calculate the Sharpe-style penalty = profit / volatility
-                risk_penalty = -abs(sharpe_like) * 0.5  # adjust strength here
+        # # --- Volatility-adjusted Sharpe-style bonus/penalty ---
+        # risk_penalty = 0 # Init risk penalty as 0
+        # if price_series is not None and len(price_series) >= 10: # If price series is set
+        #     returns = price_series.pct_change().fillna(0) # Compute the percentage change from one price to the next and convert Na's to 0
+        #     if returns.dropna().shape[0] > 1: # Calculate the volatility = standard deviation of returns
+        #         volatility = returns.std()
+        #     else:
+        #         volatility = 0 # or some small default like 1e-8 to avoid div-by-zero elsewhere
+        #     if volatility > 0: # If the volatility if greater than 0
+        #         sharpe_like = profit / volatility # Calculate the Sharpe-style penalty = profit / volatility
+        #         risk_penalty = -abs(sharpe_like) * 0.5  # adjust strength here
 
         # --- Non-linear reward scaling ---
         if profit > 0: # If the profit is positive give positive rewards
-            reward = profit ** 2 * 100 if not dense else profit * 10 # Calculate the reward = profit ^ 2 * 100 - Quadratic scaling to encourage big profits
+            reward = profit ** 2 * 100 # Calculate the reward = profit ^ 2 * 100 - Quadratic scaling to encourage big profits
         elif profit < 0: # If the profit is negative give negative rewards
-            reward = -abs(profit) ** 2 * 100 if not dense else -abs(profit) * 10 # Calculate the rewards = -| profit | ^ 2 * 100 - Quadratic scaling to discourage big losses
+            reward = -abs(profit) ** 2 * 100 # Calculate the rewards = -| profit | ^ 2 * 100 - Quadratic scaling to discourage big losses
         else: # If there is no profit (break-even) give negative rewards
             if dense: # If we are calculating dense rewards
                 # Penalize holding a break-even position
-                reward = -0.5 * self.break_even_steps # Calculate the reward = -0.5 * break_even_steps (decreases by -5 for every step we continuously break-even)
+                # reward = -0.5 * self.break_even_steps # Calculate the reward = -0.5 * break_even_steps (decreases by -5 for every step we continuously break-even)
+                reward = 0
             else: # If we are not calculating dense rewards
                 # Terminal break-even penalty includes duration-based cost
-                base_penalty = -2 # Init base penalty
+                # base_penalty = -2 # Init base penalty
                 time_penalty = -0.5 * self.break_even_steps # Calculate a time penalty for the total amount of steps we broke-even
-                reward = base_penalty + time_penalty # Calculate the final reward
-
+                # reward = base_penalty + time_penalty # Calculate the final reward
+                reward = time_penalty
         # --- Penalty for trade execution (buy/sell only) ---
         if trade_executed:
-            trade_cost = 0.002  # Hypthetical cost of making a trade = 0.2% of capital
-            reward -= trade_cost * 100  # Scale it to the reward range and apply it to the reward
+            # trade_cost = 0.002  # Hypthetical cost of making a trade = 0.2% of capital
+            # reward -= trade_cost * 100  # Scale it to the reward range and apply it to the reward
+            reward = 0
 
-        # --- Combine with risk penalty (Sharpe-style) ---
-        reward += risk_penalty
+        # # --- Combine with risk penalty (Sharpe-style) ---
+        # reward += risk_penalty
 
         # Handle possible Nan Rewards
         if not np.isfinite(reward):
@@ -565,3 +635,29 @@ class CryptoTradingEnv(gym.Env):
         return pd.Series(
             self.data[self.current_step - window:self.current_step, self.active_crypto_index, 3]
         ) # Return the close-prices of the active crypto over the given window
+    
+    def _get_action_mask(self):
+        """
+        Generates a boolean mask indicating which actions are currently legal.
+
+        Legal actions depend on the agent's current portfolio state:
+            - If no crypto is held (active_crypto_index is None):
+                → Only buy actions (indices 1 to num_cryptos) are legal.
+            - If a crypto is currently held:
+                → Only hold (index 0) and sell (index num_cryptos + 1) are legal.
+
+        Returns:
+            np.ndarray (bool): A 1D boolean array where True indicates a legal action.
+        """
+        # Initialize all actions as illegal
+        mask = np.zeros(self.action_space.n, dtype=bool)
+
+        if self.active_crypto_index is None:
+            # No crypto held: enable only buy actions (1 to num_cryptos)
+            mask[1:self.num_cryptos + 1] = True
+        else:
+            # Crypto held: enable only hold (0) and sell (num_cryptos + 1)
+            mask[0] = True
+            mask[self.num_cryptos + 1] = True
+
+        return mask
