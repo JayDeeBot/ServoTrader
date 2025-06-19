@@ -537,42 +537,44 @@ class CryptoTradingEnv(gym.Env):
             reward: Current/total rewards
         """
 
-        # # --- Volatility-adjusted Sharpe-style bonus/penalty ---
-        # risk_penalty = 0 # Init risk penalty as 0
-        # if price_series is not None and len(price_series) >= 10: # If price series is set
-        #     returns = price_series.pct_change().fillna(0) # Compute the percentage change from one price to the next and convert Na's to 0
-        #     if returns.dropna().shape[0] > 1: # Calculate the volatility = standard deviation of returns
-        #         volatility = returns.std()
-        #     else:
-        #         volatility = 0 # or some small default like 1e-8 to avoid div-by-zero elsewhere
-        #     if volatility > 0: # If the volatility if greater than 0
-        #         sharpe_like = profit / volatility # Calculate the Sharpe-style penalty = profit / volatility
-        #         risk_penalty = -abs(sharpe_like) * 0.5  # adjust strength here
+        # --- Volatility-adjusted Sharpe-style bonus/penalty ---
+        risk_penalty = 0 # Init risk penalty as 0
+        if price_series is not None and len(price_series) >= 10: # If price series is set
+            returns = price_series.pct_change().fillna(0) # Compute the percentage change from one price to the next and convert Na's to 0
+            if returns.dropna().shape[0] > 1: # Calculate the volatility = standard deviation of returns
+                volatility = returns.std()
+            else:
+                volatility = 0 # or some small default like 1e-8 to avoid div-by-zero elsewhere
+            if volatility > 0: # If the volatility if greater than 0
+                sharpe_like = profit / volatility # Calculate the Sharpe-style penalty = profit / volatility
+                risk_penalty = -abs(sharpe_like) * 0.5  # adjust strength here
 
         # --- Non-linear reward scaling ---
         if profit > 0: # If the profit is positive give positive rewards
-            reward = profit ** 2 * 100 # Calculate the reward = profit ^ 2 * 100 - Quadratic scaling to encourage big profits
+            # reward = profit ** 2 * 100 # Calculate the reward = profit ^ 2 * 100 - Quadratic scaling to encourage big profits
+            reward = profit ** 2 * 100 if not dense else profit * 10
         elif profit < 0: # If the profit is negative give negative rewards
-            reward = -abs(profit) ** 2 * 100 # Calculate the rewards = -| profit | ^ 2 * 100 - Quadratic scaling to discourage big losses
+            # reward = -abs(profit) ** 2 * 100 # Calculate the rewards = -| profit | ^ 2 * 100 - Quadratic scaling to discourage big losses
+            reward = -abs(profit) ** 2 * 100 if not dense else -abs(profit) * 10
         else: # If there is no profit (break-even) give negative rewards
             if dense: # If we are calculating dense rewards
                 # Penalize holding a break-even position
-                # reward = -0.5 * self.break_even_steps # Calculate the reward = -0.5 * break_even_steps (decreases by -5 for every step we continuously break-even)
-                reward = 0
+                reward = -0.5 * self.break_even_steps # Calculate the reward = -0.5 * break_even_steps (decreases by -5 for every step we continuously break-even)
+                # reward = 0
             else: # If we are not calculating dense rewards
                 # Terminal break-even penalty includes duration-based cost
-                # base_penalty = -2 # Init base penalty
+                base_penalty = -2 # Init base penalty
                 time_penalty = -0.5 * self.break_even_steps # Calculate a time penalty for the total amount of steps we broke-even
-                # reward = base_penalty + time_penalty # Calculate the final reward
-                reward = time_penalty
+                reward = base_penalty + time_penalty # Calculate the final reward
+                # reward = time_penalty
         # --- Penalty for trade execution (buy/sell only) ---
         if trade_executed:
-            # trade_cost = 0.002  # Hypthetical cost of making a trade = 0.2% of capital
-            # reward -= trade_cost * 100  # Scale it to the reward range and apply it to the reward
-            reward = 0
+            trade_cost = 0.002  # Hypthetical cost of making a trade = 0.2% of capital
+            reward -= trade_cost * 100  # Scale it to the reward range and apply it to the reward
+            # reward = 0
 
-        # # --- Combine with risk penalty (Sharpe-style) ---
-        # reward += risk_penalty
+        # --- Combine with risk penalty (Sharpe-style) ---
+        reward += risk_penalty
 
         # Handle possible Nan Rewards
         if not np.isfinite(reward):
