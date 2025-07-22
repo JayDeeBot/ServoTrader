@@ -84,3 +84,13 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ## 🙋 Author
 
 Created by [Jarred Deluca](mailto:jarred.g.deluca@student.uts.edu.au)
+
+## Checklist
+
+1. Use LSTM with action masking TICK
+2. Update observation space - 1 depth, 30 min additional features, remove countdown TICK
+4. Update step function - state machine, functions for each action TICK
+5. Update rewards function - state machine, different for each action TICK
+6. Update masking - allow holding at step 1, when we have a crypto we can either sell which ends the episode or buy/sell which continues it TICK
+7. Make episode max length 30 min TICK
+8. Update reset function so that each training session is chronological through time

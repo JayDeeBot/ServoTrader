@@ -50,7 +50,7 @@ class CryptoDatabaseInitialiser:
     THREAD_COUNT = 8  # Number of threads for concurrent data fetching
     KRAKEN_API_URL = "https://api.kraken.com/0/public/OHLC" # Set the Kraken URL for access cypto data
 
-    def __init__(self, csv_path, json_path, yaml_path):
+    def __init__(self, csv_path, json_path, yaml_path, start_offset_minutes=None):
         """
         Constructor inits all member variables, loads the cryto codes we are using, loads the runtime params and creates the raw data csv.
 
@@ -62,6 +62,7 @@ class CryptoDatabaseInitialiser:
         self.csv_path = csv_path # Save the csv path to member
         self.crypto_codes = self.load_crypto_codes(json_path) # Load the crypto codes in play
         self.params = self.load_params(yaml_path) # Load the runtime params
+        self.start_offset_minutes = start_offset_minutes # Save the start offset
         self.create_csv() # Create/update the raw crypto data csv
 
     def print_error(self, message):
@@ -128,7 +129,12 @@ class CryptoDatabaseInitialiser:
         """
         retries = 0 # Init retries, set to zero to begin, this will store the amount of retries performed to fetch data for the given cryto
         full_data = pd.DataFrame() # Init the data structure to store all the data for the given crypto
-        since = int(time.time()) - (interval * 60 * desired_lines) # Look into the past only as far back as the interval*desired_lines mins
+        # Start 'since' based on start_offset_minutes
+        if self.start_offset_minutes > 0:
+            since = int(time.time()) - (self.start_offset_minutes * 60)
+        else:
+            # Fallback to default "look-back" from current time
+            since = int(time.time()) - (interval * 60 * desired_lines)
 
         while len(full_data) < desired_lines and retries < self.MAX_RETRIES: # Loop ends when when we have all desired data and the retries are within limit
             try:

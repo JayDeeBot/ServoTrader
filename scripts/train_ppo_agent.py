@@ -52,7 +52,7 @@ with open('/home/jarred/git/ServoTrader/servo_trader/config/crypto_codes.json') 
 historical_df = pd.read_csv('/home/jarred/git/ServoTrader/data/historical_crypto_data.csv')
 
 # --- Create environment ---
-USE_LSTM = False  # Set to False to use MaskablePPO instead
+USE_LSTM = True  # Set to False to use MaskablePPO instead
 
 if USE_LSTM:
     # --- New method: RecurrentPPO with LSTMActionMaskWrapper ---
@@ -114,7 +114,7 @@ ppo_config = {
 }
 
 # --- Set this flag to True if continuing training ---
-CONTINUE_TRAINING = True
+CONTINUE_TRAINING = False
 
 if CONTINUE_TRAINING:
     # --- Load existing model ---
@@ -138,7 +138,7 @@ else:
 
 # --- Set up checkpointing ---
 checkpoint = CheckpointCallback(
-    save_freq=100_000, save_path="/home/jarred/git/ServoTrader/models/", name_prefix="ppo_servo_trader_jinzo"
+    save_freq=1_000, save_path="/home/jarred/git/ServoTrader/models/", name_prefix="ppo_servo_trader_jinzo"
 )
 
 # --- Train model ---

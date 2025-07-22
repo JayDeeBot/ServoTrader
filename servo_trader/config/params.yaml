@@ -1,4 +1,4 @@
 loop_interval_minutes: 1
-crypto_bars_to_analyse: 10000
+crypto_bars_to_analyse: 1000000
 BINANCE_API_KEY: "6BZOFxkzIau3dqljZu8tbbKY5tZxnptRJkOfHq6Nx5jZDbvogxseqFkaQ3RnuaBE"
 BINANCE_SECRET_KEY: "6vguZphjUuW9t6SdPZUxImWNzB2anPr91jAWHw9dwIASLeFAVnbQQMZi0iZVBdru"
