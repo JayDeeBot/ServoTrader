@@ -30,6 +30,7 @@ import sys
 import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
+import time
 import pandas as pd
 import json
 from datetime import datetime
@@ -43,16 +44,21 @@ from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor
 from sb3_contrib import MaskablePPO, RecurrentPPO
 from sb3_contrib.common.wrappers import ActionMasker
 from wrappers.action_mask_wrapper import LSTMActionMaskWrapper
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import timedelta
+
+print("Loading crypto codes...")
 
 # --- Load crypto codes ---
 with open('/home/jarred/git/ServoTrader/servo_trader/config/crypto_codes.json') as f:
     crypto_codes = json.load(f)
 
+print("Loading initial dataset...")
 # --- Load historical data ---
-historical_df = pd.read_csv('/home/jarred/git/ServoTrader/data/historical_crypto_data.csv')
+historical_df = pd.read_csv("/home/jarred/git/ServoTrader/data/split_10k_chunks_modern/000.csv")
 
 # --- Create environment ---
-USE_LSTM = True  # Set to False to use MaskablePPO instead
+USE_LSTM = False  # Set to False to use MaskablePPO instead
 
 if USE_LSTM:
     # --- New method: RecurrentPPO with LSTMActionMaskWrapper ---
@@ -114,13 +120,13 @@ ppo_config = {
 }
 
 # --- Set this flag to True if continuing training ---
-CONTINUE_TRAINING = False
+CONTINUE_TRAINING = True
 
 if CONTINUE_TRAINING:
     # --- Load existing model ---
     model_cls = RecurrentPPO if USE_LSTM else MaskablePPO
     model = model_cls.load(
-        "/home/jarred/git/ServoTrader/models/ppo_servo_trader_jinzo",
+        "/home/jarred/git/ServoTrader/models/ppo_servo_trader_squirtle",
         env=env,
         tensorboard_log=ppo_config["tensorboard_log"],
         device=ppo_config["device"]
@@ -138,11 +144,11 @@ else:
 
 # --- Set up checkpointing ---
 checkpoint = CheckpointCallback(
-    save_freq=1_000, save_path="/home/jarred/git/ServoTrader/models/", name_prefix="ppo_servo_trader_jinzo"
+    save_freq=100_000, save_path="/home/jarred/git/ServoTrader/models/", name_prefix="ppo_servo_trader_squirtle"
 )
 
 # --- Train model ---
-model.learn(total_timesteps=1_000_000, callback=checkpoint)
+model.learn(total_timesteps=100_000, callback=checkpoint)
 
 # Save the total number of timesteps completed during training
 actual_timesteps = model.num_timesteps  # Real number of steps — could be > 5000 due to n_steps batch rounding
@@ -180,4 +186,4 @@ with open(env_instance.log_path, "a") as f:
     f.write(json.dumps(training_summary) + "\n\n")
 
 # --- Save final model ---
-model.save("/home/jarred/git/ServoTrader/models/ppo_servo_trader_jinzo")
+model.save("/home/jarred/git/ServoTrader/models/ppo_servo_trader_squirtle")

@@ -179,28 +179,72 @@ class ServoTraderBinance(ServoTraderInterface):
         except Exception as e:
             print(f"{self.RED_COLOR}Error cancelling order: {e}{self.RESET_COLOR}") # Report error
 
+    # def get_order_by_id(self, order_id: str):
+    #     """
+    #     Retrieve the status/details of an order by its ID.
+
+    #     Args:
+    #         order_id (str): The unique ID of the order.
+
+    #     Returns:
+    #         Any: A platform-specific order object or status dictionary.
+    #     """
+    #     try:
+    #         symbol = self.order_symbol_map.get(order_id) # Grab the symbol associated with the order ID argument from symbol map member
+    #         if not symbol: # If there is no symbol found in the map for this ID report the issue
+    #             print(f"{self.RED_COLOR}Symbol for order {order_id} not found. Cannot retrieve status.{self.RESET_COLOR}")
+    #             return None # Return none
+
+    #         order = self.client.get_order(symbol=symbol, orderId=int(order_id)) # Fetch the order details using the symbol and ID
+    #         print(f"Order status: {order['status']}")
+    #         return order # Return the status
+    #     except Exception as e:
+    #         print(f"{self.RED_COLOR}Error fetching order: {e}{self.RESET_COLOR}") # Report error
+    #         return None # If there is an error return none
+        
     def get_order_by_id(self, order_id: str):
         """
-        Retrieve the status/details of an order by its ID.
+        Retrieve the status and executed price of an order by its ID.
 
         Args:
             order_id (str): The unique ID of the order.
 
         Returns:
-            Any: A platform-specific order object or status dictionary.
+            dict or None: Dictionary containing status, executedQty, avgPrice, and full order info if successful; None on error.
         """
         try:
-            symbol = self.order_symbol_map.get(order_id) # Grab the symbol associated with the order ID argument from symbol map member
-            if not symbol: # If there is no symbol found in the map for this ID report the issue
+            symbol = self.order_symbol_map.get(order_id)  # Get associated trading symbol
+            if not symbol:
                 print(f"{self.RED_COLOR}Symbol for order {order_id} not found. Cannot retrieve status.{self.RESET_COLOR}")
-                return None # Return none
+                return None
 
-            order = self.client.get_order(symbol=symbol, orderId=int(order_id)) # Fetch the order details using the symbol and ID
+            order = self.client.get_order(symbol=symbol, orderId=int(order_id))
             print(f"Order status: {order['status']}")
-            return order # Return the status
+
+            # Calculate average fill price if 'fills' field is available (note: not always available in get_order)
+            fills = order.get('fills', [])  # Sometimes not returned from get_order
+            if fills:
+                total_cost = sum(float(fill['price']) * float(fill['qty']) for fill in fills)
+                total_qty = sum(float(fill['qty']) for fill in fills)
+                avg_price = total_cost / total_qty if total_qty > 0 else 0.0
+            else:
+                # If 'fills' are not available, fallback to cummulativeQuoteQty / executedQty
+                total_cost = float(order.get('cummulativeQuoteQty', 0.0))
+                total_qty = float(order.get('executedQty', 0.0))
+                avg_price = total_cost / total_qty if total_qty > 0 else 0.0
+
+            return {
+                "order_id": order_id,
+                "symbol": symbol,
+                "status": order['status'],
+                "executedQty": order.get('executedQty'),
+                "avgPrice": avg_price,
+                "raw_order": order
+            }
         except Exception as e:
-            print(f"{self.RED_COLOR}Error fetching order: {e}{self.RESET_COLOR}") # Report error
-            return None # If there is an error return none
+            print(f"{self.RED_COLOR}Error fetching order: {e}{self.RESET_COLOR}")
+            return None
+
 
     def _load_step_sizes(self):
         """
@@ -235,3 +279,38 @@ class ServoTraderBinance(ServoTraderInterface):
         except Exception as e:
             print(f"{self.RED_COLOR}Error calculating saleable quantity for {symbol}: {e}{self.RESET_COLOR}") # Report error
             return 0.0 # Return 0.0 if there is an error
+        
+    def liquify(self):
+        """
+        Liquidates all non-USDT holdings by selling them for USDT at market price.
+
+        This is typically called at the start of a live trading session to ensure 
+        the agent starts from a clean, cash-only portfolio.
+
+        Returns:
+            dict: A mapping of symbols successfully liquidated with executed sell order IDs.
+        """
+        print("💧 Liquifying portfolio...")
+
+        liquidation_results = {}
+        self.portfolio = self.get_portfolio()  # Refresh portfolio
+
+        for asset, info in self.portfolio.items():
+            if asset == "USDT":
+                continue  # Skip base currency
+
+            symbol = asset + "USDT"
+            qty = self.get_saleable_quantity(symbol)
+
+            if qty > 0:
+                print(f"→ Selling {qty} of {symbol}...")
+                order_id = self.execute_sell(symbol, qty)
+                if order_id:
+                    liquidation_results[symbol] = order_id
+                else:
+                    print(f"{self.RED_COLOR}Failed to sell {symbol}.{self.RESET_COLOR}")
+            else:
+                print(f"⚠️ No saleable quantity for {symbol}.")
+
+        print("✅ Liquification complete.")
+        return liquidation_results

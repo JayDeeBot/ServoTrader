@@ -45,6 +45,9 @@ def load_jsonl_log(log_path):
 
 def validate_episode(ep, lookup):
     cash = 1.0
+    holding_symbol = None
+    buy_price = None
+    last_raw_index = None
 
     for step in ep["steps"]:
         action = step["action_type"]
@@ -53,7 +56,6 @@ def validate_episode(ep, lookup):
         profit = step.get("profit_pct", 0.0)
         raw_idx = step.get("raw_index")
 
-        # If symbol & price are present, raw_index must exist and price must match raw data
         if symbol and price is not None:
             assert raw_idx is not None, "No raw_index logged!"
             actual_price = lookup[symbol].iloc[raw_idx]["close"]
@@ -61,10 +63,28 @@ def validate_episode(ep, lookup):
                 f"Price mismatch at epi {ep['episode']}, step {step['offset']}: "
                 f"{actual_price} vs {price}"
             )
+            last_raw_index = raw_idx  # Track last valid index for timeout handling
 
-        # If action is sell, update portfolio value
-        if action == "sell":
+        if action == "buy":
+            holding_symbol = symbol
+            buy_price = price
+
+        elif action == "sell":
             cash *= (1 + float(profit) / 100)
+            holding_symbol = None
+            buy_price = None
+
+    # --- Handle implicit sell on timeout ---
+    if ep["summary"]["final_value"] != 1.0 and holding_symbol:
+        try:
+            if last_raw_index is not None:
+                final_close = lookup[holding_symbol].iloc[last_raw_index + 1]["close"]
+                profit = (final_close - buy_price) / buy_price
+                cash *= (1 + profit)
+        except Exception as e:
+            raise RuntimeError(
+                f"Error computing final value for timeout sell in epi {ep['episode']}: {e}"
+            )
 
     final = round(cash, 4)
     expected = round(ep["summary"]["final_value"], 4)
@@ -96,7 +116,7 @@ def run_log_validation_test(log_path, data_path, timeout=15):
 
 if __name__ == "__main__":
     run_log_validation_test(
-        log_path="/home/jarred/git/ServoTrader/logs/env_log_20250616_130039.jsonl",
-        data_path="/home/jarred/git/ServoTrader/data/historical_crypto_data.csv",
+        log_path="/home/jarred/git/ServoTrader/logs/env_log_20250728_114813_squirtle_test_logs.jsonl",
+        data_path="/home/jarred/git/ServoTrader/data/split_10k_chunks/000.csv",
         timeout=15,
     )

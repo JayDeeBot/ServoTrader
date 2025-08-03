@@ -68,16 +68,24 @@ def main():
     # Only uncomment if you're ready to test real trades!
     # -------------------------
 
-    # ### --- BUY ORDER TESTING --- ###
+    ### --- BUY ORDER TESTING --- ###
 
-    # # Make a buy order
-    # print("\n🛒 Testing Market Buy Order:")
-    # buy_order_id = trader.execute_buy('BTCUSDT')  # Buy a crypto and save the ID
-    # print(f"Buy Order ID: {buy_order_id}")
-    
-    # # Check the status of your buy order
-    # print("\n🛑 Testing Buy Order Status Retrieval:")
-    # trader.get_order_by_id(buy_order_id) # Check the buy order status
+    # Make a buy order
+    print("\n🛒 Testing Market Buy Order:")
+    buy_order_id = trader.execute_buy('BTCUSDT')  # Buy a crypto and save the ID
+    print(f"Buy Order ID: {buy_order_id}")
+
+    # Check the status of your buy order
+    print("\n🛑 Testing Buy Order Status Retrieval:")
+    order_info = trader.get_order_by_id(buy_order_id)  # Check the buy order status
+
+    # Print detailed results
+    if order_info:
+        print(f"✅ Order Status: {order_info['status']}")
+        print(f"💰 Executed Quantity: {order_info['executedQty']}")
+        print(f"💸 Average Execution Price: ${order_info['avgPrice']:.4f}")
+    else:
+        print("❌ Failed to retrieve order info.")
 
     # ### --- SELL ORDER TESTING --- ###
 
