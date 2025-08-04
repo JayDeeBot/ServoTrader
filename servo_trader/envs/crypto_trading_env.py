@@ -109,8 +109,9 @@ class CryptoTradingEnv(gym.Env):
         self.action_space = spaces.Discrete(1 + self.num_cryptos + 1)
 
         # Observation Space: 
-        # Recent OHLCV (Open, High, Low, Close & Volume) bars for 100 cryptos
-        # Time remaining: Normalized scalar: how much time is left in the episode
+        # Recent OHLCV (Open, High, Low, Close, Volume, vwap & count 
+        # + engineered features including [recent_return, volatility, price_position, volume_surge, trend_slope, moving_avg]) 
+        # totalling 13 features for 100 cryptos
         # Current profit: Normalized percentage profit (0 if not holding)
         # Held crypto: Index of held crypto, or a special value if none held
         obs_len = self.history_window * self.num_cryptos * self.features_per_crypto + 2 + self.num_cryptos + 1 # Calculate the length of the observation
@@ -407,7 +408,7 @@ class CryptoTradingEnv(gym.Env):
                     profit = (final_price - self.buy_price) / self.buy_price
                 self.portfolio_value *= (1 + profit) # Calculate the final portfolio value
                 reward = self._calculate_reward(profit, "SELL") # Calculate the total reward
-                 # --- ⬇ Add synthetic 'sell' step for timeout ---
+                # --- ⬇ Add synthetic 'sell' step for timeout ---
                 raw_price = None
                 if symbol in self.raw_lookup:
                     try:

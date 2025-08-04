@@ -1,207 +1,223 @@
+#!/usr/bin/env python3
 """
 crypto_database_init.py
 
-This module defines the CryptoDatabaseInitialiser class, which uses the Binance API
-(via the ccxt library) to download historical OHLCV data for a list of cryptocurrency
-symbols. The data is fetched using multithreading for speed, and stored in a standard
-format to a CSV file for use in backtesting or training reinforcement learning agents.
+A multi-threaded crypto dataset initializer for Binance OHLCV data.
+
+This script downloads the most recent minute-level OHLCV (Open, High, Low, Close, Volume)
+data for a list of crypto symbols specified in a JSON file. The number of candles to retrieve
+is controlled via a YAML configuration file. Data is fetched using the `ccxt` Binance API wrapper
+and stored in a unified CSV for downstream use (e.g., reinforcement learning environments).
 
 Key Features:
-- Multithreaded fetching of OHLCV data from Binance
-- Configurable symbol list and runtime parameters via JSON and YAML
-- Automatic retry on API errors with colored terminal output
-- Final dataset is stored in a unified format across all symbols
+- Multi-threaded data collection using ThreadPoolExecutor (default: 8 workers)
+- VWAP and count values included in the final dataset
+- ETA and progress tracking for large symbol lists
+- Handles API retries and data gaps gracefully
+- Returns the most recent N minutes of data (configurable via YAML)
 
-Author: Jarred Deluca
-Created: 2025
-License: MIT
+Intended for use with:
+- Real-time or recent history crypto trading environments
+- Feature engineering and ML-based strategies
+- Environments requiring consistent, structured OHLCV input data
+
+Author: Jarred Deluca  
+Created: 2025  
+License: MIT  
 """
 
-import pandas as pd
+import os
 import json
 import yaml
 import time
-import os
 import ccxt
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import pandas as pd
 from datetime import datetime, timezone, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 class CryptoDatabaseInitialiser:
     """
-    Generates the necessary database for each step in the ServoTrader main.
-    Sources runtime specific variables:
-        - loop_interval_minutes
-        - crypto_bars_to_analyse
-    ... and generates the raw data csv accessed by the PPO agent using Binance API.
+    A class to initialize a live crypto dataset by downloading the most recent OHLCV data
+    for multiple symbols from Binance, using multi-threading for fast collection.
 
     Features:
-        - Threaded data collection for fast batch downloading
-        - Retry logic for fault tolerance in API calls
-        - Configurable interval and data volume via YAML
-        - Color-coded terminal feedback for errors and warnings
-
-    Args:
-        csv_path (str): Path to output CSV file for storing raw OHLCV data.
-        json_path (str): Path to JSON file containing the list of crypto symbols.
-        yaml_path (str): Path to YAML file specifying runtime parameters.
+    - Reads crypto symbols from JSON
+    - Reads parameters (e.g. number of candles to collect) from YAML
+    - Uses ThreadPoolExecutor to speed up concurrent downloads
+    - Appends results to a final CSV file
+    - Supports VWAP calculation and proper feature ordering
     """
 
     RED_COLOR = "\033[91m"
     RESET_COLOR = "\033[0m"
-    MAX_RETRIES = 3
-    RETRY_DELAY = 1
     THREAD_COUNT = 8
     LIMIT = 1000
     SLEEP_BETWEEN_REQUESTS = 0.5
+    INTERVAL = '1m'
 
     def __init__(self, csv_path, json_path, yaml_path):
-        """Initialises the class, loads configs, and starts data fetching."""
+        """
+        Initializes the class and starts the CSV creation process.
+
+        Args:
+            csv_path (str): Output CSV file path.
+            json_path (str): Path to crypto_codes.json file.
+            yaml_path (str): Path to params.yaml file.
+        """
         self.csv_path = csv_path
         self.crypto_codes = self.load_crypto_codes(json_path)
         self.params = self.load_params(yaml_path)
+        self.max_candles = self.params.get("crypto_bars_to_analyse", 10000)
         self.binance = ccxt.binance({
-            'apiKey': '6BZOFxkzIau3dqljZu8tbbKY5tZxnptRJkOfHq6Nx5jZDbvogxseqFkaQ3RnuaBE',  # Optional: Insert Binance API key
-            'secret': '6vguZphjUuW9t6SdPZUxImWNzB2anPr91jAWHw9dwIASLeFAVnbQQMZi0iZVBdru',  # Optional: Insert Binance secret key
-            'enableRateLimit': True,
+            'apiKey': '',
+            'secret': '',
+            'enableRateLimit': True
         })
         self.create_csv()
 
     def print_error(self, message):
-        """Prints an error message to the console in red."""
+        """
+        Prints an error message in red for visibility.
+
+        Args:
+            message (str): Error message to print.
+        """
         print(f"{self.RED_COLOR}Error: {message}{self.RESET_COLOR}")
 
     def load_crypto_codes(self, json_path):
-        """Loads crypto symbols from a JSON file."""
+        """
+        Loads crypto symbols from the provided JSON file.
+
+        Args:
+            json_path (str): Path to the JSON file.
+
+        Returns:
+            list[str]: List of crypto symbol strings.
+        """
         try:
-            with open(json_path, 'r') as file:
-                data = json.load(file)
-            crypto_codes = data.get('crypto_codes', [])
-            if not crypto_codes:
-                raise ValueError("No crypto codes found in JSON file.")
-            return crypto_codes
+            with open(json_path, 'r') as f:
+                data = json.load(f)
+            return data.get("crypto_codes", [])
         except Exception as e:
             self.print_error(f"Failed to load crypto codes: {e}")
             return []
 
     def load_params(self, yaml_path):
-        """Loads runtime parameters from a YAML file."""
-        try:
-            with open(yaml_path, 'r') as file:
-                params = yaml.safe_load(file)
-            if not params:
-                raise ValueError("No parameters found in YAML file.")
-            return params
-        except Exception as e:
-            self.print_error(f"Failed to load parameters: {e}")
-            return {}
-
-    def fetch_crypto_data(self, symbol, interval, desired_lines):
         """
-        Fetches OHLCV data for a single crypto symbol using Binance API.
+        Loads parameters from the provided YAML file.
 
         Args:
-            symbol (str): The crypto pair (e.g., 'BTCUSDT')
-            interval (int): Time interval in minutes (e.g., 1)
-            desired_lines (int): Number of candles to fetch
+            yaml_path (str): Path to the YAML file.
 
         Returns:
-            pd.DataFrame: DataFrame of OHLCV data in ServoTrader format
+            dict: Dictionary of configuration parameters.
         """
-        retries = 0
-        full_data = []
-        # Convert seconds to milliseconds for Binance API
-        start_time = int(time.time()) - (interval * 60 * desired_lines)
-        start_time *= 1000
+        try:
+            with open(yaml_path, 'r') as f:
+                return yaml.safe_load(f)
+        except Exception as e:
+            self.print_error(f"Failed to load params: {e}")
+            return {}
 
-        while len(full_data) < desired_lines and retries < self.MAX_RETRIES:
+    def fetch_crypto_data(self, symbol):
+        """
+        Downloads the most recent OHLCV candles for a given crypto symbol.
+
+        Args:
+            symbol (str): The crypto trading pair symbol (e.g., BTCUSDT).
+
+        Returns:
+            pd.DataFrame | None: DataFrame with processed OHLCV rows, or None on failure.
+        """
+        collected = []
+        candles_needed = self.max_candles
+        end_time = None  # Start from the most recent and go backward
+
+        while len(collected) < candles_needed:
+            fetch_limit = min(self.LIMIT, candles_needed - len(collected))
             try:
-                raw = self.binance.public_get_klines({
+                params = {
                     'symbol': symbol,
-                    'interval': self.binance.timeframes[str(interval) + 'm'],
-                    'startTime': start_time,
-                    'limit': self.LIMIT
-                })
+                    'interval': self.INTERVAL,
+                    'limit': fetch_limit
+                }
+                if end_time:
+                    params['endTime'] = end_time
 
+                # Fetch data
+                raw = self.binance.publicGetKlines(params)
                 if not raw:
-                    print(f"{self.RED_COLOR}No data returned for {symbol}. Retrying.{self.RESET_COLOR}")
-                    retries += 1
-                    time.sleep(self.RETRY_DELAY)
-                    continue
+                    break
 
-                full_data.extend(raw)
-                start_time = raw[-1][0] + 60_000  # Advance start time by 1 candle
+                collected = raw + collected  # Prepend new rows to maintain chronological order
+                end_time = int(raw[0][0]) - 60_000  # Go backward 1 minute
                 time.sleep(self.SLEEP_BETWEEN_REQUESTS)
 
             except Exception as e:
-                self.print_error(f"Error fetching data for {symbol} on attempt {retries + 1}: {e}")
-                retries += 1
-                time.sleep(self.RETRY_DELAY)
+                self.print_error(f"{symbol} fetch error: {e}")
+                time.sleep(5)
 
-        # Create a DataFrame with meaningful column names
-        df = pd.DataFrame(full_data, columns=[
+        if not collected:
+            return None
+
+        # Format and clean up
+        df = pd.DataFrame(collected, columns=[
             'timestamp', 'open', 'high', 'low', 'close', 'volume',
             'close_time', 'quote_volume', 'count',
-            'taker_base_vol', 'taker_quote_vol', 'ignore']
-        )
-
-        # Convert to numeric types where relevant
+            'taker_base_vol', 'taker_quote_vol', 'ignore'
+        ])
         for col in ['open', 'high', 'low', 'close', 'volume', 'quote_volume']:
             df[col] = pd.to_numeric(df[col], errors='coerce')
 
-        # Compute VWAP and clean up infinite values
+        # Calculate VWAP and format
         df['vwap'] = df['quote_volume'] / df['volume']
         df['vwap'] = df['vwap'].replace([float('inf'), -float('inf')], pd.NA)
-
-        # Format timestamps and tag with symbol
         df['timestamp'] = pd.to_datetime(df['timestamp'].astype('int64'), unit='ms', utc=True)
         df['symbol'] = symbol
 
-        # Return final formatted DataFrame
-        return df[['timestamp', 'open', 'high', 'low', 'close', 'vwap', 'volume', 'count', 'symbol']].head(desired_lines)
+        # Return final structured DataFrame
+        return df[['timestamp', 'open', 'high', 'low', 'close', 'vwap', 'volume', 'count', 'symbol']]
 
     def create_csv(self):
         """
-        Fetches data for all crypto codes using threads and saves to a single CSV.
+        Coordinates parallel downloads of all crypto symbols and writes the result to a CSV.
         """
-        interval = self.params.get("loop_interval_minutes", 1)
-        desired_lines = self.params.get("crypto_bars_to_analyse", 10000)
-
         all_data = []
-        total_assets = len(self.crypto_codes)
-        completed_tasks = 0
-        start_time = time.time()
+        total = len(self.crypto_codes)
+        print(f"\n📡 Downloading {self.max_candles} bars for {total} symbols...\n")
 
-        # Start a thread for each symbol
+        start_time = time.time()
+        completed = 0
+
+        # Use multithreading to download data concurrently
         with ThreadPoolExecutor(max_workers=self.THREAD_COUNT) as executor:
             futures = {
-                executor.submit(self.fetch_crypto_data, symbol, interval, desired_lines): symbol
+                executor.submit(self.fetch_crypto_data, symbol): symbol
                 for symbol in self.crypto_codes
             }
 
-            # As threads complete, collect the results
             for future in as_completed(futures):
                 symbol = futures[future]
                 try:
-                    crypto_data = future.result()
-                    if crypto_data.empty:
-                        print(f"{self.RED_COLOR}Warning: No data for {symbol}. Skipping.{self.RESET_COLOR}")
-                        continue
-                    all_data.append(crypto_data)
+                    df = future.result()
+                    if df is not None and not df.empty:
+                        all_data.append(df)
+                    else:
+                        print(f"⚠️ {symbol}: No data fetched.")
                 except Exception as e:
                     self.print_error(f"Error processing {symbol}: {e}")
 
-                # Progress tracking
-                completed_tasks += 1
-                elapsed_time = time.time() - start_time
-                estimated_total_time = (elapsed_time / completed_tasks) * total_assets
-                estimated_time_left = estimated_total_time - elapsed_time
-                progress = (completed_tasks / total_assets) * 100
-                print(f"\rProgress: {progress:.2f}% - Estimated time left: {estimated_time_left:.2f} seconds", end="")
+                # Progress bar and ETA
+                completed += 1
+                elapsed = time.time() - start_time
+                pct = (completed / total) * 100
+                eta = (elapsed / completed) * (total - completed) if completed > 0 else 0
+                print(f"\r🔁 {completed}/{total} symbols | {pct:.1f}% complete | ETA: {timedelta(seconds=int(eta))}", end="")
 
-        # Final write to CSV
+        print("\n\n💾 Finalizing CSV export...")
         if all_data:
             final_df = pd.concat(all_data, ignore_index=True)
             final_df.to_csv(self.csv_path, index=False)
-            print(f"\nData saved to {self.csv_path}")
+            print(f"✅ Saved {len(final_df):,} rows to {self.csv_path}")
         else:
-            print(f"\n{self.RED_COLOR}No data retrieved. CSV not created.{self.RESET_COLOR}")
+            self.print_error("No data retrieved. CSV not created.")
