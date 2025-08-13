@@ -63,37 +63,44 @@ def main():
     balance = trader.get_cash_balance()
     print(f"USDT: {balance:.4f}")
 
+    # Check your estimated total balance (all positions)
+    print("\nTotal Balance (all assets):")
+    equity_usdt, breakdown = trader.get_estimated_balance_usdt()
+    print(f"USDT: {equity_usdt:.4f}")
+
+    # Optional: print the breakdown list for debugging
+    for entry in breakdown:
+        print(f"{entry['asset']}: {entry['amount']} (~{entry['value_usdt']:.4f} USDT)")
+
     # -------------------------
     # ⚠️ Optional Live Trade Tests
     # Only uncomment if you're ready to test real trades!
     # -------------------------
 
-    ### --- BUY ORDER TESTING --- ###
+    # ### --- BUY ORDER TESTING --- ###
 
-    # Make a buy order
-    print("\n🛒 Testing Market Buy Order:")
-    buy_order_id = trader.execute_buy('BTCUSDT')  # Buy a crypto and save the ID
-    print(f"Buy Order ID: {buy_order_id}")
+    # # Make a buy order
+    # print("\n🛒 Testing Market Buy Order:")
+    # buy_order_id = trader.execute_buy('BTCUSDT')  # Buy a crypto and save the ID
+    # print(f"Buy Order ID: {buy_order_id}")
 
-    # Check the status of your buy order
-    print("\n🛑 Testing Buy Order Status Retrieval:")
-    order_info = trader.get_order_by_id(buy_order_id)  # Check the buy order status
+    # # Check the status of your buy order
+    # print("\n🛑 Testing Buy Order Status Retrieval:")
+    # order_info = trader.get_order_by_id(buy_order_id)  # Check the buy order status
 
-    # Print detailed results
-    if order_info:
-        print(f"✅ Order Status: {order_info['status']}")
-        print(f"💰 Executed Quantity: {order_info['executedQty']}")
-        print(f"💸 Average Execution Price: ${order_info['avgPrice']:.4f}")
-    else:
-        print("❌ Failed to retrieve order info.")
+    # # Print detailed results
+    # if order_info:
+    #     print(f"✅ Order Status: {order_info['status']}")
+    #     print(f"💰 Executed Quantity: {order_info['executedQty']}")
+    #     print(f"💸 Average Execution Price: ${order_info['avgPrice']:.4f}")
+    # else:
+    #     print("❌ Failed to retrieve order info.")
 
     # ### --- SELL ORDER TESTING --- ###
 
     # # Make a sell order
     # print("\n💸 Testing Market Sell Order:")
-    # saleable_qty = trader.get_saleable_quantity("BTCUSDT") # Caculate the highest qty we can sell
-    # print(f"Saleable BTC: {saleable_qty}")
-    # sell_order_id = trader.execute_sell("BTCUSDT", saleable_qty) # Sell the crypto and save the ID
+    # sell_order_id = trader.execute_sell("BTCUSDT") # Sell the crypto and save the ID
     # print(f"Sell Order ID: {sell_order_id}")
 
     # # Check the status of your sell order

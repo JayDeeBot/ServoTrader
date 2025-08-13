@@ -68,6 +68,7 @@ class CryptoDatabaseInitialiser:
         self.crypto_codes = self.load_crypto_codes(json_path)
         self.params = self.load_params(yaml_path)
         self.max_candles = self.params.get("crypto_bars_to_analyse", 10000)
+        self.unusable_crypto_codes = []  # Track any codes that fail to fetch valid data
         self.binance = ccxt.binance({
             'apiKey': '',
             'secret': '',
@@ -123,6 +124,9 @@ class CryptoDatabaseInitialiser:
         """
         Downloads the most recent OHLCV candles for a given crypto symbol.
 
+        If the returned data is incomplete or unusable, the symbol is added to
+        the `unusable_crypto_codes` member list for later review.
+
         Args:
             symbol (str): The crypto trading pair symbol (e.g., BTCUSDT).
 
@@ -144,23 +148,26 @@ class CryptoDatabaseInitialiser:
                 if end_time:
                     params['endTime'] = end_time
 
-                # Fetch data
+                # Fetch data from Binance
                 raw = self.binance.publicGetKlines(params)
                 if not raw:
-                    break
+                    break  # No data returned, abort
 
                 collected = raw + collected  # Prepend new rows to maintain chronological order
-                end_time = int(raw[0][0]) - 60_000  # Go backward 1 minute
+                end_time = int(raw[0][0]) - 60_000  # Step backward 1 minute
                 time.sleep(self.SLEEP_BETWEEN_REQUESTS)
 
             except Exception as e:
                 self.print_error(f"{symbol} fetch error: {e}")
                 time.sleep(5)
 
+        # If no data was fetched, mark as unusable and return None
         if not collected:
+            self.unusable_crypto_codes.append(symbol)
+            self.print_error(f"{symbol} was marked unusable: no data fetched.")
             return None
 
-        # Format and clean up
+        # Format and clean up the raw OHLCV data
         df = pd.DataFrame(collected, columns=[
             'timestamp', 'open', 'high', 'low', 'close', 'volume',
             'close_time', 'quote_volume', 'count',
@@ -169,13 +176,32 @@ class CryptoDatabaseInitialiser:
         for col in ['open', 'high', 'low', 'close', 'volume', 'quote_volume']:
             df[col] = pd.to_numeric(df[col], errors='coerce')
 
-        # Calculate VWAP and format
+        # Calculate VWAP and format time columns
         df['vwap'] = df['quote_volume'] / df['volume']
         df['vwap'] = df['vwap'].replace([float('inf'), -float('inf')], pd.NA)
         df['timestamp'] = pd.to_datetime(df['timestamp'].astype('int64'), unit='ms', utc=True)
         df['symbol'] = symbol
 
-        # Return final structured DataFrame
+        # --- Timestamp Freshness Check ---
+        latest_timestamp = df['timestamp'].max()
+        current_time = pd.Timestamp.utcnow()
+        freshness_threshold = pd.Timedelta(minutes=5)
+
+        if current_time - latest_timestamp > freshness_threshold:
+            self.unusable_crypto_codes.append(symbol)
+            self.print_error(
+                f"{symbol} marked unusable: latest data is too old. "
+                f"Last timestamp: {latest_timestamp}, Current: {current_time}"
+            )
+            return None
+
+        # Check if the resulting DataFrame has enough data
+        if len(df) < self.max_candles * 0.95:  # Allow some tolerance for dropped rows
+            self.unusable_crypto_codes.append(symbol)
+            self.print_error(f"{symbol} marked unusable: only {len(df)} rows collected.")
+            return None
+
+        # Return cleaned and structured DataFrame
         return df[['timestamp', 'open', 'high', 'low', 'close', 'vwap', 'volume', 'count', 'symbol']]
 
     def create_csv(self):

@@ -303,7 +303,7 @@ class CryptoTradingEnv(gym.Env):
 
         # 2. Current profit (if holding)
         if self.active_crypto_index is not None and self.buy_price > 0:
-            current_price = self.data[self.current_step, self.active_crypto_index, 3]
+            current_price = self.data[-1, self.active_crypto_index, 3]
             current_profit = (current_price - self.buy_price) / self.buy_price
         else:
             current_profit = 0.0

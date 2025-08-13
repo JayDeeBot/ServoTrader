@@ -60,6 +60,7 @@ import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from servo_trader.servo_trader_binance import ServoTraderBinance
 from servo_trader.crypto_database_init import CryptoDatabaseInitialiser
+from threading import Lock
 
 class LiveCryptoTradingEnv(gym.Env):
     """
@@ -111,7 +112,7 @@ class LiveCryptoTradingEnv(gym.Env):
         os.makedirs(os.path.dirname(self.csv_path), exist_ok=True)
 
         self.trader = ServoTraderBinance(self.yaml_path) # Init the trader object
-        # self.trader.liquify() # Completely liquify all assets before session begins
+        self.trader.liquify() # Completely liquify all assets before session begins
 
         # Declare data storage members for the observation space and logging - set all to none to begin with
         self.data = None
@@ -127,11 +128,20 @@ class LiveCryptoTradingEnv(gym.Env):
         self.buy_order_id = None # The API buy order ID for the crypto purchased
         self.sell_order_id = None # The API sell order ID for the crypto sold
         self.buy_price = 0.0 # Buy price of the current episode
+        self.sell_price = 0.0 # Sell price for the current episode
         self.cash_balance = self.trader.get_cash_balance()  # Fetch the available cash balance from Binance
-        self.portfolio_value = self.cash_balance # Total portfolio value at each time step
         self.break_even_steps = 0 # Member to track how long we've been near break-even after a buy has been made
         self.feature_window = episode_timeout # Window used for computing additional features when pre-processing data
         self.history_window = 5  # Number of past timesteps to include in observation
+        self.unusable_crypto_codes = []  # Track any codes that fail to fetch valid data
+        self.avg_low_prices = {}  # Tracks average low prices for each code
+        self.current_action = None # Tracks the current action for reporting back to the GUI
+
+        # cadence / timing controls
+        self.step_period_seconds = 60.0      # target period per step
+        self.print_countdown = True          # print a live countdown while waiting
+        self.skip_wait_on_terminate = False  # set True to skip waiting if episode just ended
+        self.seconds_left = 0.0              # GUI can read this
 
         # Store symbol list, preprocess raw dataframe
         self.crypto_codes = sorted(crypto_codes)
@@ -163,9 +173,17 @@ class LiveCryptoTradingEnv(gym.Env):
         os.makedirs(self.log_dir, exist_ok=True) # Ensure the log exists
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S") # Record the start datetime
         self.log_path = os.path.join(self.log_dir, f"env_log_{timestamp}.jsonl") # Create a jsonl file for the log
-        self.episode_log = []  # Will hold step-level logs temporarily
-        self.total_profit_percent = 0  # For global tracking of the profit
+        self.total_profit_decimal = 0.0  # For global tracking of the profit
+        self.episode_profit_decimal = 0.0 # For the current episode return
         self.episode_counter = 0 # Stores the episode count
+        self.current_ep_profit_decimal = 0.0 # Stores the current profit of the episode at a hold step
+        self.estimated_balance_usdt = 0.0 # Stores the current estimated balance
+
+        # Manage log thread
+        self._log_lock = Lock()
+        os.makedirs(self.log_dir, exist_ok=True)
+        # make sure the file exists
+        open(self.log_path, "a").close()
 
     def preprocess_data(self, raw_df):
         """
@@ -265,24 +283,33 @@ class LiveCryptoTradingEnv(gym.Env):
 
         return tensor # Return tensor (3 Dimensions) containing all data with shape [Timesteps, Cryptos, Features] and type np Float32
 
-    def reset(self):
+    def reset(self, *, seed=None, options=None):
         """
         Initializes the environment state for a new live trading session.
-
-        Returns:
-            tuple: (initial observation, info dict including action mask)
+        Returns: (obs, info)
         """
-        # Reset active crypto index, code to none. Buy price returns to 0
+        try:
+            super().reset(seed=seed)
+        except Exception:
+            pass
+
+        # Clear position state
         self.active_crypto_index = None
         self.active_crypto_code = None
         self.buy_price = 0.0
+        self.sell_price = 0.0
+        self.episode_profit_decimal = 0.0
+        self.break_even_steps = 0
+        self.seconds_left = 0.0  # if you use the cadence timer
 
-        # Refresh balance and portfolio value from the live trader
+        # Refresh balance
         self.cash_balance = self.trader.get_cash_balance() # Assume no position held yet
-        self.portfolio_value = self.cash_balance
+        eq, _ = self.trader.get_estimated_balance_usdt()
+        self.estimated_balance_usdt = float(eq)
 
-        self.current_step = 0 # Reset the current step back to 0
-        self.start_index = self.current_step # Update the start index
+        # Episode step counters
+        self.current_step = 0
+        self.start_index = 0
 
         # Log the start of a live episode
         episode_record = {
@@ -291,11 +318,12 @@ class LiveCryptoTradingEnv(gym.Env):
             "start_timestamp": datetime.now().isoformat(),
             "cash_balance": self.cash_balance
         }
-        self.episode_log.append(episode_record) # Append the episode log
+        self._write_logline(episode_record) # Write to the log
 
-        obs = self.get_observation() # Grab the initial observation
+        obs = self._get_observation() # Grab the initial observation
+        self._refresh_crypto_codes() # Purge + replace invalid or risky crypto codes
+
         return obs, {"action_mask": self._get_action_mask()} # Return the initial observation - use the action mask to mask out illegal moves
-
 
     def _get_observation(self):
         """
@@ -307,11 +335,16 @@ class LiveCryptoTradingEnv(gym.Env):
             np.ndarray: Full flattened observation vector.
         """
         # Pull live data from Binance using CryptoDatabaseInitialiser logic
-        CryptoDatabaseInitialiser(
+        database = CryptoDatabaseInitialiser(
             csv_path=self.csv_path,
             json_path=self.json_path,
             yaml_path=self.yaml_path
         )
+
+        # Print any unusable (due to invalid data) crypto codes detected
+        if database.unusable_crypto_codes:
+            print(f"⚠️ Unusable crypto codes detected: {database.unusable_crypto_codes}")
+            self.unusable_crypto_codes = database.unusable_crypto_codes # Save the unusable codes
 
         # Load the pulled data
         self.data = pd.read_csv('/home/jarred/git/ServoTrader/data/historical_crypto_data.csv')
@@ -340,7 +373,7 @@ class LiveCryptoTradingEnv(gym.Env):
 
         # 2. Current profit (if holding)
         if self.active_crypto_index is not None and self.buy_price > 0:
-            current_price = self.data[self.current_step, self.active_crypto_index, 3]
+            current_price = self.data[-1, self.active_crypto_index, 3]
             current_profit = (current_price - self.buy_price) / self.buy_price
         else:
             current_profit = 0.0
@@ -386,97 +419,162 @@ class LiveCryptoTradingEnv(gym.Env):
             truncated: flag for when episode exceeds its time limit
             info: NA
         """
+        # --- Timing: start of step ---
+        step_start_monotonic = time.monotonic()
+
+        self.current_action = self._get_current_action(action) # Save the current action for GUI update
+
         # Init the reward and done state to 0 & False respectively
         reward = 0
         done = False
 
-        # If we have exceeded the timout steps for this episode
-        if self.current_step - self.start_index >= self.timeout_steps: # Check whether we have exceeded the timeout steps for this episode
-            done = True # Reset done flag
-            if self.active_crypto_index is not None: # Check whether there is an active crypto
-                final_price = self._sell() # Execute the sell - BLOCKING CALL completes when sell goes through & save the final price
-                # Calculate the final profit
-                if self.buy_price is None or self.buy_price == 0 or np.isnan(self.buy_price):
-                    profit = 0
+        ### ----- TIMEOUT EXCEEDED ----- ###
+        if self.current_step - self.start_index >= self.timeout_steps: # Check whether timeout has been exceeded
+            if self.active_crypto_index is not None: # Check if there is an active crypto
+                self.sell_price = self._sell() # Attempt the sell and save the sell prince
+                if self.sell_price is None: # Check if a sell proce was returned
+                    # ⚠️ Sell failed — fallback to HOLD behavior
+                    print("❌ Sell failed during timeout. Treating as HOLD.")
+                    current_price = self.data[-1, self.active_crypto_index, 3] # Grab the current price of the active crypto
+                    if self.buy_price is None or self.buy_price == 0 or np.isnan(self.buy_price): # Safety check for profit
+                        profit = 0
+                    else:
+                        profit = (current_price - self.buy_price) / self.buy_price # Calculate the profit
+                    self.current_ep_profit_decimal = profit # Save the current profit decimal for GUI
+                    reward = self._calculate_reward(profit, "HOLD") # Calculate the reward (Hold)
+                    # Log HOLD step (still holding after failed timeout sell)
+                    self._log_step(
+                        action=0,
+                        action_type="hold",
+                        reward=reward,
+                        symbol=self.active_crypto_code,
+                        price=current_price,
+                        profit_pct=(profit * 100.0),
+                    )
                 else:
-                    profit = (final_price - self.buy_price) / self.buy_price
-                reward = self._calculate_reward(profit, "SELL") # Calculate the total reward
-                self.portfolio_value *= (1 + profit) # Calculate the final portfolio value
-                # --- ⬇ Add synthetic 'sell' step for timeout ---
-                raw_price = None
-                if symbol in self.raw_lookup:
-                    try:
-                        raw_price = float(self.raw_lookup[symbol].iloc[self.current_step]["close"])
-                    except:
-                        raw_price = None
+                    # ✅ Sell succeeded — handle as normal
+                    if self.buy_price is None or self.buy_price == 0 or np.isnan(self.buy_price): # Safety check for profit
+                        profit = 0
+                    else:
+                        profit = (self.sell_price - self.buy_price) / self.buy_price # Calculate the profit
+                    reward = self._calculate_reward(profit, "SELL") # Calculate the reward (Sell)
+                    # Log the sell info
+                    self._log_step(
+                        action=self.num_cryptos + 1,
+                        action_type="sell",
+                        reward=reward,
+                        symbol=self.active_crypto_code,
+                        price=self.sell_price,
+                        profit_pct=(profit * 100.0),
+                        buy_price=self.buy_price if self.buy_price else 0.0,
+                        sell_price=self.sell_price,
+                    )
+                    done = True # Set the done flag to true - episode is overs
 
-                timeout_sell_step = {
-                    "type": "step",
-                    "offset": int(self.global_step - self.start_step),
-                    "action": self.num_cryptos + 1,
-                    "action_type": "sell",
-                    "symbol": symbol,
-                    "price": raw_price if raw_price is not None else float(final_price),
-                    "profit_pct": profit * 100,
-                    "reward": float(reward),
-                    "raw_index": int(self.raw_lookup[symbol].index[self.current_step]) if symbol in self.raw_lookup else None
-                }
-                self.episode_log.append(timeout_sell_step)
-
-                self._last_sell_context = {
-                    "symbol": symbol,
-                    "buy_price": self.buy_price,
-                    "sell_price": final_price,
-                    "profit": profit * 100,
-                }
-                self._end_episode() # End the episode
-
+        ### ----- BUY ACTION ----- ###
         # If the action is Buy - Buy Action range is 1:num_cryptos (for #num_cryptos cryptos)
         if 1 <= action <= self.num_cryptos:  # Buy crypto[i]
             if self.active_crypto_index is None: # Check whether we already holding a crypto - prevents double buying
                 self.active_crypto_index = action - 1 # Set active crypto index - Adjust index by -1 to match 0-based indexing
                 self.active_crypto_code = self._get_buy_action_code(action) # Save the active crypto code
                 self.buy_price = self._buy(self.active_crypto_code) # Execute the buy - BLOCKING CALL completes when buy goes through & save the buy price
-                reward = self._calculate_reward(0.0, "BUY", price_series=self._get_price_series())
+                if self.buy_price is None:
+                    print("❌ Buy failed. Treating as HOLD.")
+                    self.active_crypto_index = None
+                    self.active_crypto_code = None
+                    reward = 0.0  # Nil penalty for error
+                else:
+                    reward = self._calculate_reward(0.0, "BUY", price_series=self._get_price_series())
+                    # Log BUY (no profit_pct on buy; include step, action, symbol, price)
+                    self._log_step(
+                        action=action,
+                        action_type="buy",
+                        reward=reward,
+                        symbol=self.active_crypto_code,
+                        price=self.buy_price,
+                    )
             else: # If we are already holding a crypto then give a small negative reward - teaches the agent the legal moves
                 reward = -0.1  # Penalty: already holding
+                print("ILLEGAL BUY MOVE")
+                # self._log_step(action=action, action_type="buy", reward=reward) # Log illegal move
         
+        ### ----- HOLD ACTION ----- ###
         # If the Action is Hold - 0 = Hold
         elif action == 0:  # Hold
             if self.active_crypto_index is not None: # If we are holding a crypto
-                price_now = self.data[-1, self.active_crypto_index, 3] # Save the current price
+                # current_price = self.data[-1, self.active_crypto_index, 3] # Save the current price
+                current_price = float(self.raw_lookup[self.active_crypto_code].iloc[-1]["close"])  # Raw close price
                 if self.buy_price is None or self.buy_price == 0 or np.isnan(self.buy_price): # Calculate the current profit
                     profit = 0  # or np.nan or some fallback strategy
                 else:
-                    profit = (price_now - self.buy_price) / self.buy_price
+                    profit = (current_price - self.buy_price) / self.buy_price
+                self.current_ep_profit_decimal = profit # Save the current profit decimal for GUI
                 reward = self._calculate_reward(profit, "HOLD") # Calculate the reward at this time step (dense)
-
                 if abs(profit) < 0.001: # If the profit is near 0
                     self.break_even_steps += 1 # Increment the break_even_steps up - assists discouraging break-even trades
                 else: # If we have made positive/negative profit
                     self.break_even_steps = 0  # Reset the break_even_steps
+                # Log HOLD
+                self._log_step(
+                    action=0,
+                    action_type="hold",
+                    reward=reward,
+                    symbol=self.active_crypto_code,
+                    price=current_price,
+                    profit_pct=(profit * 100.0),
+                )
             else: # If we are not holding a crypto then give a small negative reward - teaches the agent the legal moves
                 reward = -0.1  # Penalty: holding nothing
+                print("ILLEGAL HOLD MOVE")
+                # self._log_step(action=0, action_type="hold", reward=reward) # Log illegal action
 
+        ### ----- SELL ACTION ----- ###
         # If the Action if Sell - num_cryptos + 1 = Sell
         elif action == self.num_cryptos + 1:  # Sell
             if self.active_crypto_index is not None: # Check whether we are holding a crypto - prevents double selling
-                sell_price = self._sell() # Execute the sell - BLOCKING CALL completes when sell goes through & save the sell price
-                # sell_price = self.data[self.current_step, self.active_crypto_index, 3] # Take the price at the current step for the current crypto as the sell price
-                if self.buy_price is None or self.buy_price == 0 or np.isnan(self.buy_price): # Calculate the total profit
-                    profit = 0  # or handle however you prefer (e.g., skip trade)
+                self.sell_price = self._sell() # Execute the sell - BLOCKING CALL completes when sell goes through & save the sell price
+                if self.sell_price is None:
+                     # ⚠️ Sell failed — fallback to HOLD behavior
+                    print("❌ Sell failed during timeout. Treating as HOLD.")
+                    # current_price = self.data[-1, self.active_crypto_index, 3]
+                    current_price = float(self.raw_lookup[self.active_crypto_code].iloc[-1]["close"])  # Raw close price
+                    if self.buy_price is None or self.buy_price == 0 or np.isnan(self.buy_price):
+                        profit = 0
+                    else:
+                        profit = (current_price - self.buy_price) / self.buy_price
+                    self.current_ep_profit_decimal = profit # Save the current profit decimal for GUI
+                    reward = self._calculate_reward(profit, "HOLD")
+                    # Log HOLD because we’re still in the position
+                    self._log_step(
+                        action=0,
+                        action_type="hold",
+                        reward=reward,
+                        symbol=self.active_crypto_code,
+                        price=current_price,
+                        profit_pct=(profit * 100.0),
+                    )
+                    # Do NOT mark done or end episode
                 else:
-                    profit = (sell_price - self.buy_price) / self.buy_price
-                self.portfolio_value *= (1 + profit) # Calculate the final portfolio value
-                reward = self._calculate_reward(profit,"SELL") # Calculate the final reward for the episode
-                self._end_episode() # End the episode
-                done = True # Reset done flag
+                    if self.buy_price is None or self.buy_price == 0 or np.isnan(self.buy_price): # Calculate the total profit
+                        profit = 0  # or handle however you prefer (e.g., skip trade)
+                    else:
+                        profit = (self.sell_price - self.buy_price) / self.buy_price
+                    reward = self._calculate_reward(profit,"SELL") # Calculate the final reward for the episode
+                    # Log SELL with buy/sell price + profit_pct
+                    self._log_step(
+                        action=self.num_cryptos + 1,
+                        action_type="sell",
+                        reward=reward,
+                        symbol=self.active_crypto_code,
+                        profit_pct=(profit * 100.0),
+                        buy_price=self.buy_price if self.buy_price else 0.0,
+                        sell_price=self.sell_price,
+                    )
+                    done = True # Reset done flag
             else: # If we are not holding a crypto then give a small negative reward - teaches the agent the legal moves
                 reward = -0.1  # Penalty: nothing to sell
-
-        self.current_step += 1 # Increment the step count
-
-        obs = self._get_observation() # Grab the current observation
+                print("ILLEGAL SELL MOVE")
+                # self._log_step(action=self.num_cryptos + 1, action_type="sell", reward=reward)
 
         # --- Sanitize reward ---
         if np.isnan(reward) or np.isinf(reward):
@@ -498,98 +596,27 @@ class LiveCryptoTradingEnv(gym.Env):
         #     else:
         #         print(f"[Env] Episode terminated due to sell at step {self.current_step - self.start_index} (relative to episode start)")
 
-        # Initialize placeholders for price/profit values
-        current_price = None       # Normalized close price
-        profit = None              # Profit percentage
-        raw_price = None           # Raw close price
-        raw_buy_price = None       # Buy price from raw data
-        raw_sell_price = None      # Sell price from raw data
-
-        # If currently holding a crypto, compute prices and profit
-        if self.active_crypto_index is not None:
-            current_price = float(self.data[-1, self.active_crypto_index, 3])  # Normalized close
-            profit = ((current_price - self.buy_price) / self.buy_price) * 100 if self.buy_price else 0.0
-            symbol = self.crypto_codes[self.active_crypto_index]
-            if symbol in self.raw_lookup:
-                raw_price = float(self.raw_lookup[symbol].iloc[-1]["close"])  # Raw close price
-
-        # Create the base JSON record for this step
-        step_event = {
-            "type": "step",
-            "action": int(action),  # Ensure action is native int
-            "reward": float(reward)
-        }
-
-        # Add price and symbol info if holding a position
-        if self.active_crypto_index is not None:
-            step_event["symbol"] = symbol
-            step_event["price"] = raw_price if raw_price is not None else current_price
-            step_event["profit_pct"] = float(profit)
-
-        # --- BUY action logging ---
-        if 1 <= action <= self.num_cryptos:
-            buy_symbol = self.crypto_codes[action - 1]
-            if buy_symbol in self.raw_lookup:
-                raw_buy_price = float(self.raw_lookup[buy_symbol].iloc[-1]["close"])
-            step_event["action_type"] = "buy"
-            step_event["symbol"] = buy_symbol
-            step_event["price"] = raw_buy_price if raw_buy_price is not None else float(self.buy_price)
-
-        # --- SELL action logging ---
-        elif action == self.num_cryptos + 1 and hasattr(self, "_last_sell_context"):
-            ctx = self._last_sell_context
-            sell_symbol = ctx["symbol"]
-            if sell_symbol in self.raw_lookup:
-                raw_sell_price = float(self.raw_lookup[sell_symbol].iloc[-1]["close"])
-            step_event["action_type"] = "sell"
-            step_event["symbol"] = sell_symbol
-            step_event["buy_price"] = float(ctx["buy_price"])
-            step_event["sell_price"] = raw_sell_price if raw_sell_price is not None else float(ctx["sell_price"])
-            step_event["profit_pct"] = float(ctx["profit"])
-            del self._last_sell_context  # Cleanup context after logging
-
-        # --- HOLD or fallback logging ---
-        else:
-            step_event["action_type"] = "hold" if action == 0 else "unknown"
-
-        # --- Add raw_index for test alignment ---
-        if step_event.get("symbol") and step_event["symbol"] in self.raw_lookup:
-            raw_idx = int(self.raw_lookup[step_event["symbol"]].index[-1])
-            step_event["raw_index"] = raw_idx
-
-        # Append the structured step log
-        self.episode_log.append(step_event)
 
         # --- At episode end, log summary ---
         if done:
-            self.episode_counter += 1
-            episode_steps = int(self.current_step - self.start_index)
-            percent_return = float((self.portfolio_value - 1.0) * 100)
-            self.total_profit_percent += percent_return
-
+            self.episode_counter += 1 # Increment the episode counter
+            # Calculate the episode return
+            if self.buy_price is None or self.buy_price == 0 or np.isnan(self.buy_price):
+                self.episode_profit_decimal = 0.0
+            else:
+                self.episode_profit_decimal = (self.sell_price - self.buy_price) / self.buy_price
+            # Calculate the total profit percentage over all episodes in this session
+            self.total_profit_decimal = (1.0 + self.total_profit_decimal) * (1.0 + self.episode_profit_decimal) - 1.0
+            # Format the episode summary log
             summary = {
                 "type": "episode_end",
                 "episode": self.episode_counter,
-                "steps": episode_steps,
-                "final_value": float(self.portfolio_value),
-                "episode_return_pct": percent_return,
+                "episode_return_pct": 100 * self.episode_profit_decimal,
+                "total_profit_pct": 100 * self.total_profit_decimal,
                 "termination": "timeout" if truncated else "sell",
                 "timestamp": datetime.now().isoformat()
             }
-
-            if self.raw_df is not None and self.active_crypto_index is not None:
-                final_sym = self.crypto_codes[self.active_crypto_index]
-                if final_sym in self.raw_lookup:
-                    summary["final_raw_close"] = float(self.raw_lookup[final_sym].iloc[-1]["close"])
-
-            self.episode_log.append(summary)
-
-            # Persist JSONL to disk
-            with open(self.log_path, "a") as f:
-                for record in self.episode_log:
-                    f.write(json.dumps(record) + "\n")
-
-            self.episode_log = []  # Clear buffer for next episode
+            self._write_logline(summary) # Write to the log
 
         # Compute legal action mask
         action_mask = np.zeros(self.action_space.n, dtype=bool)
@@ -599,10 +626,59 @@ class LiveCryptoTradingEnv(gym.Env):
             action_mask[0] = True  # Hold
             action_mask[self.num_cryptos + 1] = True  # Sell
 
+        # Fetch the estimated balance
+        if (self.current_step % 3) == 0:  # update every ~3 minutes
+            eq, _ = self.trader.get_estimated_balance_usdt()
+            self.estimated_balance_usdt = float(eq)
+
         info["action_mask"] = action_mask
 
-        return obs, reward, terminated, truncated, info # Return the current observation, current/total reward & done flag
+        # --- Enforce 1-minute cadence at the end of the step ---
+        # If you want to skip waiting after a hard terminate, set skip_wait_on_terminate = True
+        should_wait = True
+        if self.skip_wait_on_terminate and (terminated or truncated):
+            should_wait = False
 
+        if should_wait:
+            elapsed = time.monotonic() - step_start_monotonic
+            remaining = self.step_period_seconds - elapsed
+
+            if remaining > 0:
+                # Live countdown (once per second) and GUI seconds_left updates
+                # Use integer countdown for prints; keep self.seconds_left as precise float
+                end_time = time.monotonic() + remaining
+                while True:
+                    now = time.monotonic()
+                    self.seconds_left = max(0.0, end_time - now)
+
+                    # Print countdown once per second if enabled
+                    if self.print_countdown:
+                        # ceiling for display (so "2.1s" shows as "3s" remaining)
+                        display_seconds = int(self.seconds_left + 0.999)
+                        print(f"⏳ Waiting for next minute tick: {display_seconds}s remaining", end="\r", flush=True)
+
+                    if self.seconds_left <= 0.0:
+                        break
+
+                    # Sleep in short chunks so GUI can poll seconds_left smoothly
+                    time.sleep(min(1.0, self.seconds_left))
+
+                # Clear the countdown line (cosmetic)
+                if self.print_countdown:
+                    print(" " * 64, end="\r")
+
+            else:
+                # Overran the cadence; no waiting. Expose zero to GUI.
+                self.seconds_left = 0.0
+        else:
+            # Skipped wait (typically on terminate/truncate)
+            self.seconds_left = 0.0
+
+        self.current_step += 1 # Increment the step count
+        obs = self._get_observation() # Grab the current observation
+
+        return obs, reward, terminated, truncated, info # Return the current observation, current/total reward & done flag
+    
     def _calculate_reward(self, profit, action, price_series=None):
         """
         Computes a risk-adjusted and trade-cost-aware reward signal.
@@ -662,38 +738,6 @@ class LiveCryptoTradingEnv(gym.Env):
             reward = 0 # Give zero rewards if the value is Nan or infinite
 
         return reward
-
-    def _end_episode(self):
-        """
-        Concludes the current episode.
-
-        Updates: 
-            active crypto index
-            active crypto code
-            buy price
-            cash balance
-        """
-        # Save sell log data before resetting state
-        if self.active_crypto_index is not None:
-            self._last_sell_context = {
-                "symbol": self.crypto_codes[self.active_crypto_index],
-                "buy_price": self.buy_price,
-                "sell_price": self.data[self.current_step, self.active_crypto_index, 3],
-                "profit": (
-                    (self.data[self.current_step, self.active_crypto_index, 3] - self.buy_price)
-                    / self.buy_price * 100 if self.buy_price else 0
-                )
-            }
-
-        # Reset members as safety guard - same as for reset function
-        self.active_crypto_index = None # Reset the active crypto index to none
-        self.active_crypto_code = None # Reset the active crypto code to none
-        self.buy_price = 0.0 # Reset the buy price back to 0 - safety guardself.portfolio_value = self.cash_balance
-        self.current_step = 0 # Reset the current step back to 0
-        self.start_index = self.current_step # Update the start index
-
-        self.cash_balance = self.trader.get_cash_balance() # Update the cash balance
-        self.portfolio_value = self.cash_balance # Set the portfolio value to the current cash balance
 
     def render(self, mode='human'):
         """
@@ -795,7 +839,7 @@ class LiveCryptoTradingEnv(gym.Env):
             order_info = self.trader.get_order_by_id(self.buy_order_id)
             if order_info and order_info['status'] == 'FILLED':
                 print("✅ Buy order filled.")
-                return order_info['avgPrice']
+                return float(order_info['avgPrice'])
             time.sleep(5)
     
     def _sell(self):
@@ -805,7 +849,7 @@ class LiveCryptoTradingEnv(gym.Env):
         Returns:
             float: The average sell price after confirmation.
         """
-        self.sell_order_id = self.trader.execute_sell(self.active_crypto_code, self.trader.get_saleable_quantity(self.active_crypto_code))  # Sell full qty
+        self.sell_order_id = self.trader.execute_sell(self.active_crypto_code)
         if self.sell_order_id is None:
             print("❌ Sell order failed to execute.")
             return None
@@ -815,5 +859,195 @@ class LiveCryptoTradingEnv(gym.Env):
             order_info = self.trader.get_order_by_id(self.sell_order_id)
             if order_info and order_info['status'] == 'FILLED':
                 print("✅ Sell order filled.")
-                return order_info['avgPrice']
+                return float(order_info['avgPrice'])
             time.sleep(5)
+
+    def _refresh_crypto_codes(self):
+        """
+        Validates the current list of crypto codes and replaces any that are no longer valid.
+
+        This includes checking:
+        1. Whether the code is still tradeable on Binance (via ServoTraderBinance).
+        2. Whether the code has dropped dangerously below its average low price.
+        3. Whether the code fails to provide valid historical OHLCV data (via CryptoDatabaseInitialiser).
+
+        Invalid codes are replaced with new, valid codes using a retry mechanism. The replacement is confirmed
+        by temporarily overwriting the JSON file and testing with a new database instance.
+
+        This method is designed to ensure that only healthy, tradable cryptos are used in the environment.
+        """
+        # Step 1: Identify any codes that can no longer be traded
+        untradeable = self.trader.find_untradeable_codes(self.crypto_codes)
+
+        # Step 2: Identify any codes that are significantly below their average low (at risk of crashing)
+        unreliable = self._check_avg_low_price()
+
+        # Step 3: Report issues to terminal
+        if untradeable:
+            print(f"🔻 These symbols are not currently tradeable on Binance:\n{untradeable}")
+
+        if unreliable:
+            print(f"🔻 These symbols are considered unreliable based on price behavior:\n{unreliable}")
+
+        # Step 4: Update the unusable codes list with any new findings
+        to_replace = list(set(self.unusable_crypto_codes + untradeable + unreliable))
+        self.unusable_crypto_codes = to_replace  # Ensure uniqueness and consistency
+
+        if not to_replace:
+            return  # ✅ Nothing to fix
+
+        # Step 5: Begin retry loop to find and validate replacement codes
+        print("🔄 Refreshing crypto codes...")
+        found = False
+        new_codes = []
+
+        while not found:
+            # Attempt to find viable replacements
+            new_codes = self.trader.find_viable_replacement_codes(
+                replace_codes=to_replace,
+                current_codes=self.crypto_codes
+            )
+
+            # Validate that we have enough new codes
+            if len(new_codes) < len(to_replace):
+                print("⚠️ Not enough replacement codes found. Retrying...")
+                time.sleep(2)
+                continue
+
+            # ✅ TEMPORARILY overwrite the JSON with the proposed new codes
+            updated_codes = sorted([c for c in self.crypto_codes if c not in to_replace] + new_codes)
+            with open(self.json_path, "w") as f:
+                json.dump({"crypto_codes": updated_codes}, f, indent=4)
+
+            # Instantiate a fresh database to validate the new codes via OHLCV history
+            temp_database = CryptoDatabaseInitialiser(
+                csv_path=self.csv_path,
+                json_path=self.json_path,
+                yaml_path=self.yaml_path
+            )
+
+            # If all new codes passed the data test, we can exit the loop
+            if not temp_database.unusable_crypto_codes:
+                found = True
+            else:
+                print(f"❌ Invalid historical data for: {temp_database.unusable_crypto_codes}. Retrying...")
+                time.sleep(2)
+
+        # Step 6: Apply the new valid codes and reinitialize environment data
+        self.crypto_codes = sorted(new_codes + [c for c in self.crypto_codes if c not in to_replace])
+        print(f"✅ Updated crypto codes: {self.crypto_codes}")
+
+        # Rebuild the observation space (updates raw_df and related members)
+        self._get_observation()
+
+    def _check_avg_low_price(self) -> list[str]:
+        """
+        Identifies crypto symbols whose current close price has dropped more than 80% below
+        their historical average low price.
+
+        This function maintains a member dictionary `avg_low_prices` which stores the rolling
+        average low price for each symbol seen. On each call:
+            - Symbols not yet in the list are added using their historical data.
+            - Symbols with valid price data are compared to their avg low.
+            - Symbols with a close price < 20% of avg low are marked 'unreliable'.
+            - Unreliable symbols are removed from `avg_low_prices`.
+
+        Returns:
+            list[str]: A list of symbols considered unreliable and flagged for removal.
+        """
+        unreliable = []
+
+        for symbol, df in self.raw_lookup.items():
+            try:
+                # Ensure historical low price can be calculated
+                if symbol not in self.avg_low_prices:
+                    avg_low = df['low'].mean()
+                    if pd.isna(avg_low) or avg_low <= 0:
+                        continue  # Skip if low price is invalid
+                    self.avg_low_prices[symbol] = avg_low
+
+                avg_low = self.avg_low_prices[symbol]
+                current_close = df.iloc[-1]['close']
+
+                # Check if current close has dropped 80% below the historical avg low
+                if current_close < 0.2 * avg_low:
+                    print(f"⚠️ {symbol} dropped below crash threshold: close={current_close:.4f}, avg_low={avg_low:.4f}")
+                    unreliable.append(symbol)
+
+            except Exception as e:
+                print(f"\033[91mError processing {symbol} in avg_low check: {e}\033[0m")
+                continue
+
+        # Remove unreliable symbols from the tracked average lows
+        for symbol in unreliable:
+            self.avg_low_prices.pop(symbol, None)
+
+        return unreliable
+    
+    def _log_step(self, *, action: int, action_type: str, reward: float,
+              symbol: str | None = None,
+              price: float | None = None,
+              profit_pct: float | None = None,
+              buy_price: float | None = None,
+              sell_price: float | None = None):
+        """
+        Append a single structured step log entry.
+        Required fields: type, step, action, action_type, reward.
+        Optional: symbol, price (raw if available), profit_pct, buy_price, sell_price.
+        """
+        step_no = int(self.current_step - self.start_index) + 1  # 1-based within episode
+        rec = {
+            "type": "step",
+            "step": step_no,
+            "action": int(action),
+            "action_type": action_type,
+            "reward": float(reward),
+        }
+        if symbol is not None:
+            rec["symbol"] = symbol
+        if price is not None:
+            rec["price"] = float(price)
+        if profit_pct is not None:
+            rec["profit_pct"] = float(profit_pct)
+        if buy_price is not None:
+            rec["buy_price"] = float(buy_price)
+        if sell_price is not None:
+            rec["sell_price"] = float(sell_price)
+
+        self._write_logline(rec) # Write to the log
+
+    def _get_current_action(self, action: int) -> str:
+        """
+        Converts an action index into a human-readable description for GUI or logging.
+
+        Args:
+            action (int): The discrete action index from the RL agent.
+
+        Returns:
+            str: A string describing the action, e.g. 'HOLD', 'BUY: BTCUSDT', or 'SELL: BTCUSDT'.
+        """
+        if action == 0:
+            return "HOLD"
+
+        elif 1 <= action <= self.num_cryptos:
+            symbol = self.crypto_codes[action - 1]  # Adjust for 0-based index
+            return f"BUY: {symbol}"
+
+        elif action == self.num_cryptos + 1:
+            # Show the held symbol if there is one
+            if self.active_crypto_index is not None:
+                symbol = self.crypto_codes[self.active_crypto_index]
+                return f"SELL: {symbol}"
+            return "SELL"
+
+        return "UNKNOWN"
+    
+    def _write_logline(self, rec: dict):
+        """Append one JSONL line safely (thread-safe if GUI reads concurrently)."""
+        try:
+            with self._log_lock:
+                with open(self.log_path, "a") as f:
+                    f.write(json.dumps(rec) + "\n")
+        except Exception as e:
+            # Optional: soft-fail so trading never breaks on logging errors
+            print(f"[Log warn] Failed to write log line: {e}")

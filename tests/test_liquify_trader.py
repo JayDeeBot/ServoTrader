@@ -11,6 +11,9 @@ Author: Jarred Deluca
 Created: 2025
 """
 
+import os
+import sys
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from servo_trader.servo_trader_binance import ServoTraderBinance
 import time
 
