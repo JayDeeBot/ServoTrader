@@ -576,16 +576,6 @@ class LiveCryptoTradingEnv(gym.Env):
                 print("ILLEGAL SELL MOVE")
                 # self._log_step(action=self.num_cryptos + 1, action_type="sell", reward=reward)
 
-        # --- Sanitize reward ---
-        if np.isnan(reward) or np.isinf(reward):
-            print(f"[Warning] Invalid reward encountered at step {self.current_step}: {reward}")
-            reward = 0.0
-
-        # --- Sanitize observation ---
-        if np.any(np.isnan(obs)) or np.any(np.isinf(obs)):
-            print(f"[Warning] Invalid observation at step {self.current_step}")
-            obs = np.nan_to_num(obs, nan=0.0, posinf=1e6, neginf=-1e6)
-
         terminated = done # Terminated & done will be the same for our application
         truncated = (self.current_step - self.start_index) >= self.timeout_steps # Truncated is true if the total steps of the episode exceeds the timeout steps
         info = {}
@@ -676,6 +666,16 @@ class LiveCryptoTradingEnv(gym.Env):
 
         self.current_step += 1 # Increment the step count
         obs = self._get_observation() # Grab the current observation
+
+        # --- Sanitize reward ---
+        if np.isnan(reward) or np.isinf(reward):
+            print(f"[Warning] Invalid reward encountered at step {self.current_step}: {reward}")
+            reward = 0.0
+
+        # --- Sanitize observation ---
+        if np.any(np.isnan(obs)) or np.any(np.isinf(obs)):
+            print(f"[Warning] Invalid observation at step {self.current_step}")
+            obs = np.nan_to_num(obs, nan=0.0, posinf=1e6, neginf=-1e6)
 
         return obs, reward, terminated, truncated, info # Return the current observation, current/total reward & done flag
     
@@ -864,80 +864,107 @@ class LiveCryptoTradingEnv(gym.Env):
 
     def _refresh_crypto_codes(self):
         """
-        Validates the current list of crypto codes and replaces any that are no longer valid.
-
-        This includes checking:
-        1. Whether the code is still tradeable on Binance (via ServoTraderBinance).
-        2. Whether the code has dropped dangerously below its average low price.
-        3. Whether the code fails to provide valid historical OHLCV data (via CryptoDatabaseInitialiser).
-
-        Invalid codes are replaced with new, valid codes using a retry mechanism. The replacement is confirmed
-        by temporarily overwriting the JSON file and testing with a new database instance.
-
-        This method is designed to ensure that only healthy, tradable cryptos are used in the environment.
+        Validate the symbol universe and replace any broken/unreliable ones with new,
+        healthy symbols — strictly preserving the original universe size (num_cryptos).
         """
-        # Step 1: Identify any codes that can no longer be traded
-        untradeable = self.trader.find_untradeable_codes(self.crypto_codes)
+        # --- Step 0: determine current + target universe size (fixed) ---
+        target_n = int(getattr(self, "num_cryptos", len(self.crypto_codes)))
+        current = list(dict.fromkeys(self.crypto_codes))  # keep order + dedupe
+        if len(current) != len(self.crypto_codes):
+            # sanitize in memory if duplicates slipped in
+            self.crypto_codes = current[:target_n]
 
-        # Step 2: Identify any codes that are significantly below their average low (at risk of crashing)
-        unreliable = self._check_avg_low_price()
+        # --- Step 1: compute symbols to replace ---
+        untradeable = self.trader.find_untradeable_codes(self.crypto_codes) or []
+        unreliable = self._check_avg_low_price() or []
+        # self.unusable_crypto_codes may have been set by _get_observation()
+        known_unusable = getattr(self, "unusable_crypto_codes", []) or []
 
-        # Step 3: Report issues to terminal
-        if untradeable:
-            print(f"🔻 These symbols are not currently tradeable on Binance:\n{untradeable}")
+        to_replace = sorted(set(untradeable) | set(unreliable) | set(known_unusable))
 
-        if unreliable:
-            print(f"🔻 These symbols are considered unreliable based on price behavior:\n{unreliable}")
+        print(f"[DEBUG] Untradeable: {untradeable}")
+        print(f"[DEBUG] Unreliable: {unreliable}")
+        print(f"[DEBUG] Known unusable: {known_unusable}")
+        print(f"[DEBUG] Final to_replace: {to_replace}")
 
-        # Step 4: Update the unusable codes list with any new findings
-        to_replace = list(set(self.unusable_crypto_codes + untradeable + unreliable))
-        self.unusable_crypto_codes = to_replace  # Ensure uniqueness and consistency
+        if to_replace:
+            print(f"🔻 Replacement candidates ({len(to_replace)}): {to_replace}")
 
         if not to_replace:
+            # nothing to do; still ensure size is exactly target_n
+            if len(self.crypto_codes) != target_n:
+                print(f"⚠️ Symbol count drift detected ({len(self.crypto_codes)} != {target_n}); trimming.")
+                self.crypto_codes = sorted(self.crypto_codes)[:target_n]
             return  # ✅ Nothing to fix
 
-        # Step 5: Begin retry loop to find and validate replacement codes
+        # --- Step 2: request viable replacements (may return many — we will filter/slice) ---
         print("🔄 Refreshing crypto codes...")
-        found = False
-        new_codes = []
+        current_set = set(self.crypto_codes)
+        needed = len(to_replace)
 
-        while not found:
-            # Attempt to find viable replacements
-            new_codes = self.trader.find_viable_replacement_codes(
+        # We'll loop until we can validate a full, fixed-size list
+        while True:
+            # Ask trader for a big pool, then filter
+            pool = self.trader.find_viable_replacement_codes(
                 replace_codes=to_replace,
                 current_codes=self.crypto_codes
-            )
+            ) or []
 
-            # Validate that we have enough new codes
-            if len(new_codes) < len(to_replace):
-                print("⚠️ Not enough replacement codes found. Retrying...")
+            # Remove any codes that are already in the current set (avoid duplicates)
+            pool = [c for c in pool if c not in current_set]
+
+            if len(pool) < needed:
+                print(f"⚠️ Only found {len(pool)} unique replacements, need {needed}. Retrying…")
                 time.sleep(2)
                 continue
 
-            # ✅ TEMPORARILY overwrite the JSON with the proposed new codes
-            updated_codes = sorted([c for c in self.crypto_codes if c not in to_replace] + new_codes)
-            with open(self.json_path, "w") as f:
-                json.dump({"crypto_codes": updated_codes}, f, indent=4)
+            # Slice EXACTLY the number we need
+            replacements = pool[:needed]
 
-            # Instantiate a fresh database to validate the new codes via OHLCV history
+            # Build updated list: drop the to_replace, add replacements, keep fixed size
+            kept = [c for c in self.crypto_codes if c not in to_replace]
+            updated = kept + replacements
+
+            # Enforce fixed size (target_n) — trim or pad (padding should never happen here)
+            updated = sorted(list(dict.fromkeys(updated)))  # dedupe once more just in case
+            if len(updated) > target_n:
+                updated = updated[:target_n]
+            elif len(updated) < target_n:
+                # shouldn't happen; but if it does, try to top up from the remaining pool
+                top_up_needed = target_n - len(updated)
+                extra = [c for c in pool if c not in updated][:top_up_needed]
+                updated += extra
+                updated = updated[:target_n]
+
+            # ✅ TEMPORARILY overwrite JSON with the proposed new codes
+            with open(self.json_path, "w") as f:
+                json.dump({"crypto_codes": updated}, f, indent=4)
+
+            # Validate via a fresh database pull
             temp_database = CryptoDatabaseInitialiser(
                 csv_path=self.csv_path,
                 json_path=self.json_path,
                 yaml_path=self.yaml_path
             )
 
-            # If all new codes passed the data test, we can exit the loop
-            if not temp_database.unusable_crypto_codes:
-                found = True
+            bad = temp_database.unusable_crypto_codes or []
+            if not bad:
+                # success — lock it in
+                self.crypto_codes = updated
+                self.unusable_crypto_codes = []  # reset after successful refresh
+                print(f"✅ Updated crypto codes ({len(self.crypto_codes)}): {self.crypto_codes}")
+                break
             else:
-                print(f"❌ Invalid historical data for: {temp_database.unusable_crypto_codes}. Retrying...")
+                print(f"❌ Invalid historical data for: {bad}. Retrying…")
+                # remove bad from updated and try to refill only those slots
+                to_replace = bad  # next loop will try to replace just these
+                current_set = set([c for c in updated if c not in bad])
+                # keep the good portion in self.crypto_codes while we search
+                self.crypto_codes = sorted(list(current_set))[:target_n]
                 time.sleep(2)
 
-        # Step 6: Apply the new valid codes and reinitialize environment data
-        self.crypto_codes = sorted(new_codes + [c for c in self.crypto_codes if c not in to_replace])
-        print(f"✅ Updated crypto codes: {self.crypto_codes}")
-
-        # Rebuild the observation space (updates raw_df and related members)
+        # --- Step 3: rebuild observation inputs (same universe size, so model-compatible) ---
+        # NOTE: observation_space shape remains constant because target_n is fixed.
         self._get_observation()
 
     def _check_avg_low_price(self) -> list[str]:

@@ -360,7 +360,7 @@ class LiveEnvRenderer:
         # Episode & steps
         episode = env.episode_counter + 1
         step = env.current_step + 1
-        steps_left = max(0, getattr(env, "timeout_steps", 0) - env.current_step)
+        steps_left = max(0, getattr(env, "timeout_steps", 0) - env.current_step - 1)
         countdown = getattr(env, "seconds_left", 0.0)
 
         # Action & position

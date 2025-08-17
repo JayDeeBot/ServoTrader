@@ -145,7 +145,7 @@ else:
 # --- Set up checkpointing ---
 checkpoint = CheckpointCallback(
     save_freq=100_000, save_path="/home/jarred/git/ServoTrader/models/", name_prefix="ppo_servo_trader_squirtle"
-)
+)   
 
 # --- Train model ---
 model.learn(total_timesteps=100_000, callback=checkpoint)
