@@ -36,4 +36,12 @@ venv/
 *.txt
 *.h5
 *.npy
-*.pkl
+*.pkl__pycache__/
+data/
+logs/
+models/
+servo_trader/env_logs/
+*.jsonl
+*.zip
+*.csv
+*.tfevents.*
