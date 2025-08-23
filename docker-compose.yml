@@ -1,0 +1,43 @@
+services:
+  live-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: servotrader-live:latest
+    container_name: servotrader-live
+    restart: unless-stopped
+
+    # Publish the Flask web UI
+    ports:
+      - "8080:8080"
+
+    # Mount runtime assets (NO secrets baked into image)
+    volumes:
+      - ./models:/app/models:ro
+      - ./servo_trader/config/params.yaml:/app/config/params.yaml:ro
+      - ./servo_trader/config/crypto_codes.json:/app/config/crypto_codes.json:ro
+      - ./data:/app/data
+      - ./logs:/app/logs
+      # X11 socket not needed when DISABLE_GUI=1
+      # - /tmp/.X11-unix:/tmp/.X11-unix:rw
+
+    environment:
+      # Paths (container-side)
+      - MODEL_PATH=/app/models/ppo_servo_trader_squirtle.zip
+      - CRYPTO_CODES_PATH=/app/config/crypto_codes.json
+      - PARAMS_PATH=/app/config/params.yaml
+      - DATA_DIR=/app/data
+      - LOG_DIR=/app/logs
+      - EPISODE_TIMEOUT=120
+      # Web UI config
+      - WEB_HOST=0.0.0.0
+      - WEB_PORT=8080
+      # Disable Tk GUI (we're using Flask)
+      - DISABLE_GUI=1
+      # X11 vars not needed when GUI disabled
+      # - DISPLAY=${DISPLAY}
+      # - QT_X11_NO_MITSHM=1
+
+    working_dir: /app
+    command: >
+      python scripts/web_live_ppo_agent.py

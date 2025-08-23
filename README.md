@@ -86,3 +86,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 Created by [Jarred Deluca](mailto:jarred.g.deluca@student.uts.edu.au)
 
 ## TODO List
+
+1. Create preliminary training environment(s)
+    (a) Buy Training: At each episode attempt the agent makes a buy decision attempting to select the crypto code that will increase at the greatest rate at the next timestep. Rewards are shaped accordingly.
+    (b) Hold/Sell Training: At each episode the agent is asked to make a Hold/Sell decision about a crypto held for a given observation. If Hold; positive rewards are awarded if the value increases, negative if it decreases; if Sell; inverse rewards.

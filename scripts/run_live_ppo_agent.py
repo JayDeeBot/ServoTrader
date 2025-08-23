@@ -42,7 +42,7 @@ from gui.live_renderer import LiveEnvRenderer  # Ensure this path matches where 
 # --- Configurable Paths ---
 MODEL_PATH = "/home/jarred/git/ServoTrader/models/ppo_servo_trader_squirtle.zip"
 CRYPTO_CODES_PATH = "/home/jarred/git/ServoTrader/servo_trader/config/crypto_codes.json"
-EPISODE_TIMEOUT = 30  # minutes per episode
+EPISODE_TIMEOUT = 120  # minutes per episode
 
 # Toggle for quick console debugging of mask/state each step
 DEBUG_MASK = False

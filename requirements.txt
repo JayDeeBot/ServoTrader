@@ -1,9 +1,18 @@
-pandas>=1.5.0
-numpy>=1.21
-requests>=2.25
-scikit-learn>=1.0
-xgboost>=1.7
-catboost>=1.2
-pyyaml>=6.0
-python-binance>=1.0.17
-alpaca-trade-api>=3.0.0
+# Core
+numpy==1.26.4
+pandas==2.2.2
+scipy==1.13.1
+PyYAML==6.0.2
+
+# RL
+gymnasium==0.29.1
+stable-baselines3==2.3.2
+sb3-contrib==2.3.0
+tensorboard==2.17.1
+
+# Market APIs (pick what you use; both are fine)
+ccxt==4.4.23
+python-binance==1.0.19
+
+# Web app
+Flask==3.0.3
