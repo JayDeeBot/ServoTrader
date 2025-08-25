@@ -440,7 +440,7 @@ class CryptoTradingEnv(gym.Env):
         # --- Periodically load a new 10k-row dataset every 10k steps ---
         if (self.global_step + 1) % 10000 == 0:
             chunk_index = (self.global_step // 10000) + 1
-            chunk_path = f"/home/jarred/git/ServoTrader/data/split_10k_chunks_modern/{chunk_index:03}.csv"
+            chunk_path = f"/home/jarred/git/ServoTrader/data/split_10k_chunks_ancient/{chunk_index:03}.csv"
 
             print(f"📦 Loading dataset chunk: {chunk_path}")
             if not os.path.exists(chunk_path):

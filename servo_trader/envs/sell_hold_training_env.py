@@ -1,74 +1,66 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-sell_hold_training_env.py
+sell_hold_training_env.py  (robust, chunking-enabled)
 
-SellHoldTrainingEnv — a single-decision, HOLD/SELL pretraining environment
-for cryptocurrency trading policies.
-
-Purpose
--------
-Pretrain a policy to decide whether to HOLD or SELL an already-held crypto at
-the current timestep. The episode ends immediately after the decision.
-
-Reward
-------
-- Compute the **future return** over a lookahead horizon H for the *held* symbol:
-      r = (Close[t+H] - Close[t]) / Close[t]
-- If action == HOLD: reward =  r
-- If action == SELL: reward = -r
-(Linear, sign-correct; optionally bounded via tanh if desired.)
-
-Key Properties
---------------
-- Action space shape matches your main env:
-    {0: Hold, 1..N: Buy[i-1], N+1: Sell}
-  but we **mask** everything except HOLD (0) and SELL (N+1).
-- Observation shape matches your main env:
-  stacked [history_window, N, F] + [time_remaining, current_profit, held_one_hot(N+1)].
-  - time_remaining fixed at 1.0 (single-step)
-  - current_profit fixed at 0.0 at decision time
-  - held_one_hot marks the selected held symbol (index>0)
-- Single-step episodes (fast pretraining; dense signal).
-- No disk logging.
-
-Configurable
-------------
-- history_window (default 5)
-- lookahead_steps H (default 30)
-- held_selection: "random" or "round_robin" (default "random")
-- reward_bounded: if True, applies tanh scale to keep rewards in [-1, 1]
-
-Dependencies
-------------
-- gymnasium
-- numpy
-- pandas
-- scipy (for linregress used in engineered features)
-
-Author: Jarred Deluca
-Created: 2025
-License: MIT
+Single-decision HOLD/SELL pretraining environment with:
+- Canonical symbol normalization on BOTH config codes & CSV chunks
+- Tolerant detection of symbol column names (symbol/pair/ticker)
+- Periodic dataset chunk loading (e.g., every 10k episodes)
+- Future-return reward: HOLD = +r, SELL = -r (optional tanh bounding)
 """
+
+from __future__ import annotations
+
+import os
+import re
+from typing import Literal, Tuple, List
 
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 import pandas as pd
 from scipy.stats import linregress
-from typing import Literal, Tuple, List
 
 
 # -----------------------------
-# Utility: slope for features
+# Utilities
 # -----------------------------
 def slope_func(x: np.ndarray) -> float:
-    """
-    Fit a simple linear regression to a 1D array `x` and return the slope.
-
-    Used with pandas .rolling().apply(...) to estimate trend.
-    """
+    """Linear slope over a 1D window (for engineered feature)."""
     return linregress(np.arange(len(x)), x).slope if len(x) > 1 else 0.0
+
+
+def _norm_symbol(s: str) -> str:
+    """
+    Normalize symbols to canonical BASEQUOTE:
+      - uppercase
+      - remove '/', '-', '_'
+      e.g., 'btc/usdt' -> 'BTCUSDT', 'XBT-USD' -> 'XBTUSD'
+    """
+    if not isinstance(s, str):
+        return s
+    s = s.strip().upper()
+    return re.sub(r"[\/\-_]", "", s)
+
+
+def _ensure_symbol_column(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ensure the dataframe has a 'symbol' column; accept 'pair'/'ticker' aliases.
+    Lower-cases columns to be tolerant of casing. Adds 'symbol_norm'.
+    """
+    df = df.copy()
+    df.columns = [c.strip().lower() for c in df.columns]
+    if "symbol" not in df.columns:
+        for cand in ("pair", "ticker"):
+            if cand in df.columns:
+                df.rename(columns={cand: "symbol"}, inplace=True)
+                break
+    if "symbol" not in df.columns:
+        raise ValueError(f"No symbol/pair/ticker column found. Columns={list(df.columns)}")
+    df["symbol"] = df["symbol"].astype(str).str.strip()
+    df["symbol_norm"] = df["symbol"].map(_norm_symbol)
+    return df
 
 
 class SellHoldTrainingEnv(gym.Env):
@@ -76,13 +68,15 @@ class SellHoldTrainingEnv(gym.Env):
     Single-decision SELL/HOLD pretraining environment.
 
     At reset():
-        - Choose a timestep t and a *held* symbol i (random or round-robin).
+        - Advance a rolling time pointer.
+        - Choose a *held* symbol i (random or round-robin).
     At step(action):
-        - action ∈ {0: HOLD, N+1: SELL} (all others masked)
+        - Legal actions: HOLD (0), SELL (N+1). Others masked.
         - Compute look-ahead return r_i(t→t+H) on raw prices.
-        - Reward =  r if HOLD, else -r if SELL.
-        - done=True (episode terminates).
+        - Reward =  +r if HOLD,  -r if SELL  (optionally tanh-bounded).
+        - done=True (single-step episode).
     """
+
     metadata = {"render.modes": ["human"]}
 
     def __init__(
@@ -95,47 +89,45 @@ class SellHoldTrainingEnv(gym.Env):
         held_selection: Literal["random", "round_robin"] = "random",
         reward_bounded: bool = False,
         seed: int | None = None,
+        # --- Chunking knobs (match buy env) ---
+        chunk_dir: str | None = "/home/jarred/git/ServoTrader/data/split_10k_chunks_ancient",
+        chunk_size: int = 10_000,
+        start_chunk_index: int = 0,          # index for the *initial* `data`
+        enable_chunking: bool | None = None, # None => auto True if dir exists
     ):
-        """
-        Args:
-            data: Stacked OHLCV(+count, vwap) dataframe with a 'symbol' column.
-            crypto_codes: List of symbols to include (e.g., 100 cryptos).
-            episode_timeout: Kept for feature/shape parity (not used to truncate).
-            history_window: Number of past steps to include in observation.
-            lookahead_steps: Horizon H for future return calculation.
-            held_selection: How to choose the held symbol per episode.
-            reward_bounded: If True, apply tanh scaling to the linear return.
-            seed: Optional RNG seed for reproducibility (random selection).
-        """
         super().__init__()
         self.rng = np.random.default_rng(seed)
 
-        # Config
-        self.crypto_codes = sorted(list(crypto_codes))
+        # --- Config (normalize configured codes) ---
+        self.crypto_codes = sorted({_norm_symbol(c) for c in crypto_codes})
         self.timeout_steps = int(episode_timeout)
         self.history_window = int(history_window)
         self.lookahead_steps = int(lookahead_steps)
         self.held_selection = held_selection
         self.reward_bounded = reward_bounded
 
-        # Preprocess -> self.data (normalized features), self.raw_close (unscaled)
-        self.data, self.raw_close = self._preprocess_data(data)
+        # --- Chunking config/state ---
+        self.chunk_dir = chunk_dir
+        self.chunk_size = int(chunk_size)
+        self.loaded_chunk_index = int(start_chunk_index)
+        if enable_chunking is None:
+            self.enable_chunking = bool(self.chunk_dir and os.path.isdir(self.chunk_dir))
+        else:
+            self.enable_chunking = bool(enable_chunking)
 
-        # Shapes
-        self.num_timesteps, self.num_cryptos, self.features_per_crypto = self.data.shape
+        # --- Initial data prep (robust symbol handling) ---
+        self.raw_df = _ensure_symbol_column(data)
+        self._rebuild_lookups_and_tensors(self.raw_df, first_time=True)
 
-        # --- Action space (unchanged shape) ---
-        # 0 = Hold, 1..N = Buy, N+1 = Sell
+        # --- Action/Observation spaces (unchanged shape semantics) ---
         self.action_space = spaces.Discrete(1 + self.num_cryptos + 1)
-
-        # --- Observation space (unchanged shape) ---
         obs_len = (
             self.history_window * self.num_cryptos * self.features_per_crypto
             + 2  # time_remaining, current_profit
             + (self.num_cryptos + 1)  # held_one_hot
         )
         low = np.zeros(obs_len, dtype=np.float32)
-        # allow negative for the current_profit slot (kept at 0, but shape-compatible)
+        # allow negative current_profit slot (even though we keep it 0 here)
         low[-(self.num_cryptos + 1 + 1)] = -1.0
         high = np.ones(obs_len, dtype=np.float32)
         self.observation_space = spaces.Box(low=low, high=high, dtype=np.float32)
@@ -148,20 +140,70 @@ class SellHoldTrainingEnv(gym.Env):
         # For round-robin symbol selection
         self._round_idx = 0
 
+        # Global step counter (episodes == steps for single-decision env)
+        self.global_step = 0
+
+        print(
+            f"[SellHoldEnv] init: CSV syms(norm)={len(set(self.raw_df['symbol_norm']))} | "
+            f"JSON codes(norm)={len(set(self.crypto_codes))} | Using={self.num_cryptos} symbols"
+        )
+
+    # -------------------------------------------------------
+    # Internal: construct tensors from a (normalized) dataframe
+    # -------------------------------------------------------
+    def _rebuild_lookups_and_tensors(self, df: pd.DataFrame, first_time: bool = False) -> None:
+        """
+        Given a dataframe with 'symbol' and 'symbol_norm':
+          - Intersect with configured codes (already normalized)
+          - Build data tensor [T, N, F] and raw_close [T, N]
+          - Update env shapes / bookkeeping
+        """
+        # Group lookups keyed by normalized symbol
+        self.raw_lookup = {sym: g.reset_index(drop=True) for sym, g in df.groupby("symbol_norm")}
+
+        # Build tensors
+        data, raw_close, used_codes = self._preprocess_data(df)
+
+        self.data = data
+        self.raw_close = raw_close
+        self.num_timesteps, self.num_cryptos, self.features_per_crypto = self.data.shape
+        self.crypto_codes = used_codes  # normalized, ordered
+
+        if first_time:
+            pass
+        else:
+            # On chunk reload, reset local pointer to a safe start
+            self.pointer = max(0, self.history_window - 1)
+            self.current_step = self.pointer
+
     # -------------------
     # Data preprocessing
     # -------------------
-    def _preprocess_data(self, raw_df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
+    def _preprocess_data(self, raw_df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, List[str]]:
         """
-        Convert stacked dataframe into normalized [T, N, F] tensor and preserve
-        a raw (unscaled) close-price tensor [T, N] for unbiased returns.
+        Convert stacked dataframe into:
+          - data_tensor: [T, N, F] normalized features
+          - raw_close  : [T, N]     raw close prices
+        using NORMALIZED symbols for membership/grouping.
+        """
+        if "symbol_norm" not in raw_df.columns:
+            raw_df = _ensure_symbol_column(raw_df)
 
-        Engineered features mirror your main env to maintain PPO input semantics.
-        """
-        codes = sorted(raw_df["symbol"].unique())
-        codes = [c for c in codes if c in self.crypto_codes]
-        N = len(codes)
-        T = raw_df.groupby("symbol").size().min()
+        # Intersect CSV symbols with configured set (both normalized)
+        csv_syms = sorted(set(raw_df["symbol_norm"].astype(str).unique()))
+        overlap = [s for s in csv_syms if s in self.crypto_codes]
+        N = len(overlap)
+        if N == 0:
+            sample_csv = csv_syms[:10]
+            sample_cfg = sorted(self.crypto_codes)[:10]
+            raise ValueError(
+                "No overlapping symbols between dataset and crypto_codes after normalization.\n"
+                f"Example CSV syms: {sample_csv}\nExample JSON codes: {sample_cfg}\n"
+                "Check separators (/, -, _), case, and exchange naming (BTC vs XBT)."
+            )
+
+        # Equal length across symbols (clamp to min available T)
+        T = raw_df.groupby("symbol_norm").size().min()
 
         feature_cols = ["open", "high", "low", "close", "vwap", "volume", "count"]
         added = ["recent_return", "volatility", "price_position", "volume_surge", "trend_slope", "moving_avg"]
@@ -173,9 +215,9 @@ class SellHoldTrainingEnv(gym.Env):
 
         window = max(2, int(self.timeout_steps))
 
-        for j, sym in enumerate(codes):
+        for j, sym_norm in enumerate(overlap):
             df = (
-                raw_df.loc[raw_df["symbol"] == sym, feature_cols]
+                raw_df.loc[raw_df["symbol_norm"] == sym_norm, feature_cols]
                 .head(T)
                 .astype(float)
                 .copy()
@@ -226,8 +268,33 @@ class SellHoldTrainingEnv(gym.Env):
 
             data_tensor[:, j, :] = df[all_cols].to_numpy(dtype=np.float32)
 
-        self.crypto_codes = codes
-        return data_tensor, raw_close
+        return data_tensor, raw_close, overlap  # overlap is normalized symbol order
+
+    # -------------------
+    # Chunk loader
+    # -------------------
+    def _load_next_chunk(self) -> None:
+        """
+        Load the next CSV chunk, rebuild lookups/tensors, and reset local indices.
+        Raises FileNotFoundError if the file is missing.
+        """
+        if not self.enable_chunking:
+            return
+
+        self.loaded_chunk_index += 1
+        path = os.path.join(self.chunk_dir, f"{self.loaded_chunk_index:03}.csv")
+        print(f"📦 Loading dataset chunk: {path}")
+
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"❌ Chunk {self.loaded_chunk_index:03}.csv not found at {path}!")
+
+        new_df = pd.read_csv(path)
+        new_df = _ensure_symbol_column(new_df)
+
+        self.raw_df = new_df
+        self._rebuild_lookups_and_tensors(self.raw_df, first_time=False)
+
+        print(f"✅ Chunk {self.loaded_chunk_index:03}.csv loaded and preprocessed")
 
     # -------------
     # Gym methods
@@ -235,14 +302,13 @@ class SellHoldTrainingEnv(gym.Env):
     def reset(self, *, seed=None, options=None):
         """
         Start a new episode:
-
-        - Advance time pointer so we iterate over most timesteps.
-        - Select a held symbol (random or round-robin).
-        - Return the observation at current_step and the HOLD/SELL mask.
+          - Advance time pointer (wrap safely with lookahead margin).
+          - Select a held symbol (random or round-robin).
+          - Return observation and HOLD/SELL mask.
         """
         super().reset(seed=seed)
 
-        # Advance pointer (use every point); keep one future step for returns
+        # Advance pointer; keep one future step for returns
         self.pointer += 1
         max_start = self.num_timesteps - 2  # need at least one future step
         if self.pointer > max_start:
@@ -263,30 +329,40 @@ class SellHoldTrainingEnv(gym.Env):
     def step(self, action: int):
         """
         Single decision:
-            - If HOLD (0): reward = +future_return(held)
-            - If SELL (N+1): reward = -future_return(held)
+            - HOLD (0):  reward = +future_return(held)
+            - SELL (N+1): reward = -future_return(held)
             - Episode terminates immediately.
+        Also rolls over dataset every `chunk_size` episodes if chunking is enabled.
         """
         mask = self._get_action_mask()
         if action < 0 or action >= self.action_space.n or not mask[action]:
             # Illegal action → zero reward, terminate to keep training robust
             reward = 0.0
-            return self._get_observation(), float(reward), True, False, {"action_mask": mask}
+            obs = self._get_observation()
+            terminated, truncated = True, False
 
-        r = self._future_return(self.current_step, self.held_index, self.lookahead_steps)
+            # Count the episode and maybe roll the chunk
+            self.global_step += 1
+            if self.enable_chunking and self.chunk_size > 0 and (self.global_step % self.chunk_size == 0):
+                self._load_next_chunk()
 
-        if action == 0:  # HOLD
-            reward = r
-        else:            # SELL at index N+1
-            reward = -r
+            return obs, float(reward), terminated, truncated, {"action_mask": mask}
 
+        # Compute reward on the held symbol
+        r = self._future_return(self.current_step, int(self.held_index), self.lookahead_steps)
+        reward = r if action == 0 else -r  # HOLD vs SELL
         if self.reward_bounded:
-            # Optional: squash via tanh to [-1, 1] for stability with large moves
-            reward = float(np.tanh(reward))
+            reward = float(np.tanh(reward))  # optional squashing to [-1, 1]
 
         # Single-step episode ends
         terminated, truncated = True, False
-        obs = self._get_observation()  # returned for interface completeness
+        obs = self._get_observation()
+
+        # Episode complete; increment global step and possibly roll chunk
+        self.global_step += 1
+        if self.enable_chunking and self.chunk_size > 0 and (self.global_step % self.chunk_size == 0):
+            self._load_next_chunk()
+
         return obs, float(reward), terminated, truncated, {"action_mask": mask}
 
     # -------------------
@@ -315,8 +391,6 @@ class SellHoldTrainingEnv(gym.Env):
             window = np.concatenate([pad, window], axis=0)
 
         obs_vec = window.flatten().astype(np.float32)
-
-        # Extra fields for shape parity
         time_remaining = np.array([1.0], dtype=np.float32)
         current_profit = np.array([0.0], dtype=np.float32)
 
@@ -330,7 +404,6 @@ class SellHoldTrainingEnv(gym.Env):
         if np.any(~np.isfinite(full)):
             full = np.nan_to_num(full, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
 
-        # Shape check for integration debugging
         assert full.shape == self.observation_space.shape, \
             f"Obs shape mismatch: expected {self.observation_space.shape}, got {full.shape}"
         return full
@@ -348,7 +421,7 @@ class SellHoldTrainingEnv(gym.Env):
         """
         Compute raw-price future return for symbol i from t to t+H:
             (C[t+H,i] - C[t,i]) / C[t,i]
-        Clamps t+H to the dataset end; returns 0 if denominator is zero.
+        Clamps t+H to the dataset end; returns 0 if denominator is zero/invalid.
         """
         t0 = t
         t1 = min(self.num_timesteps - 1, t + max(1, H))

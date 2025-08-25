@@ -50,12 +50,12 @@ from datetime import timedelta
 print("Loading crypto codes...")
 
 # --- Load crypto codes ---
-with open('/home/jarred/git/ServoTrader/servo_trader/config/crypto_codes.json') as f:
+with open('/home/jarred/git/ServoTrader/servo_trader/config/crypto_codes_ancient.json') as f:
     crypto_codes = json.load(f)
 
 print("Loading initial dataset...")
 # --- Load historical data ---
-historical_df = pd.read_csv("/home/jarred/git/ServoTrader/data/split_10k_chunks_modern/000.csv")
+historical_df = pd.read_csv("/home/jarred/git/ServoTrader/data/split_10k_chunks_ancient/000.csv")
 
 # --- Create environment ---
 USE_LSTM = False  # Set to False to use MaskablePPO instead

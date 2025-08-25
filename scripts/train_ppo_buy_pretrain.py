@@ -4,47 +4,6 @@
 train_ppo_buy_pretrain.py
 
 PPO pretraining script for BuyTrainingEnv (single-decision, buy-only ranking env).
-
-Overview
---------
-This script pretrains a PPO policy to *rank/select* cryptocurrencies using the
-BuyTrainingEnv. Each episode is exactly one decision: pick the best crypto to
-buy at the current timestep. Reward is a rank-based score derived from future
-returns over a configurable lookahead horizon.
-
-Why this pretraining?
----------------------
-By training on a pure selection task with dense, well-shaped rewards (ranking),
-the policy learns feature representations that correlate with future outperformance.
-You can later fine-tune this policy on the full trading environment (hold/sell,
-transaction costs, risk penalties, etc.).
-
-Features
---------
-- Loads historical data and crypto codes
-- Wraps BuyTrainingEnv with action masking (MaskablePPO)
-- Fresh training or resume from checkpoint
-- TensorBoard logging
-- Periodic model checkpoints
-
-Usage
------
-- Set CONTINUE_TRAINING below as needed.
-- Run:
-    /bin/python3.11 /home/jarred/git/ServoTrader/scripts/train_ppo_buy_pretrain.py
-- TensorBoard:
-    tensorboard --logdir /home/jarred/git/ServoTrader/logs --port 6006
-  then open http://localhost:6006
-
-Dependencies
-------------
-- stable-baselines3
-- sb3-contrib  (for MaskablePPO and ActionMasker)
-- gymnasium, numpy, pandas
-
-Author: Jarred Deluca
-Project: ServoTrader
-License: MIT
 """
 
 # scripts/train_ppo_buy_pretrain.py
@@ -53,6 +12,7 @@ import os
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
+import re
 import json
 import time
 from datetime import datetime
@@ -65,31 +25,100 @@ from stable_baselines3.common.callbacks import CheckpointCallback
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.wrappers import ActionMasker
 
-# 👇 Import your BuyTrainingEnv (make sure the path/package matches your repo)
+# 👇 Import your BuyTrainingEnv
 from servo_trader.envs.buy_training_env import BuyTrainingEnv
 
 
 # --------------------------
 # Configurable paths/flags
 # --------------------------
-CODES_PATH = "/home/jarred/git/ServoTrader/servo_trader/config/crypto_codes.json"
-DATA_PATH  = "/home/jarred/git/ServoTrader/data/split_10k_chunks_modern/000.csv"
+CODES_PATH = "/home/jarred/git/ServoTrader/servo_trader/config/crypto_codes_ancient.json"
+DATA_PATH  = "/home/jarred/git/ServoTrader/data/split_10k_chunks_ancient/000.csv"
 
 MODEL_DIR  = "/home/jarred/git/ServoTrader/models"
 LOG_DIR    = "/home/jarred/git/ServoTrader/logs"
 MODEL_NAME = "ppo_buy_pretrain_bulbasaur"
 
-TOTAL_TIMESTEPS   = 300_000         # adjust as needed
-CHECKPOINT_EVERY  = 100_000         # steps per checkpoint
-CONTINUE_TRAINING = False           # set True to resume from MODEL_DIR/MODEL_NAME.zip
+TOTAL_TIMESTEPS   = 1_000_000
+CHECKPOINT_EVERY  = 100_000
+CONTINUE_TRAINING = False
 
 # BuyTrainingEnv knobs
 HISTORY_WINDOW   = 5
-LOOKAHEAD_STEPS  = 30               # future-return horizon for ranking
-REWARD_MODE      = "zero_to_one"    # or "minus_one_to_one"
-EPISODE_TIMEOUT  = 30               # not used for termination here; kept for parity
+LOOKAHEAD_STEPS  = 30
+REWARD_MODE      = "zero_to_one"
+EPISODE_TIMEOUT  = 30
 
 
+# --------------------------
+# Helpers (robust + normalized)
+# --------------------------
+def _norm_symbol(s: str) -> str:
+    """Normalize to canonical BASEQUOTE (uppercase, strip / - _)."""
+    s = (s or "").strip().upper()
+    return re.sub(r"[\/\-_]", "", s)
+
+def _looks_like_symbol(s: str) -> bool:
+    """Heuristic to avoid mistaking config keys for symbols."""
+    return bool(re.fullmatch(r"[A-Z0-9]{5,15}", s or ""))
+
+def load_crypto_codes(path: str) -> list[str]:
+    """
+    Robustly load codes from JSON supporting shapes like:
+      - ["BTCUSDT", "ETHUSDT", ...]
+      - {"codes": [...]}, {"crypto_codes": [...]}, {"symbols": [...]}, {"tickers": [...]}
+      - { "BTCUSDT": {...}, "ETHUSDT": {...} }  (dict-of-meta; uses KEYS as last resort)
+      - { "CRYPTOCODES": ["BTCUSDT", ...] }     (values win)
+    """
+    with open(path, "r") as f:
+        blob = json.load(f)
+
+    codes = None
+    if isinstance(blob, list):
+        codes = blob
+    elif isinstance(blob, dict):
+        # 1) Common keys
+        for k in ("codes", "crypto_codes", "symbols", "tickers"):
+            v = blob.get(k)
+            if isinstance(v, list) and all(isinstance(x, str) for x in v):
+                codes = v
+                break
+        # 2) Any dict value that is a list[str]
+        if codes is None:
+            for v in blob.values():
+                if isinstance(v, list) and all(isinstance(x, str) for x in v):
+                    codes = v
+                    break
+        # 3) Dict-of-meta: use KEYS if they look like symbols (last resort)
+        if codes is None:
+            keys = [k for k in blob.keys() if isinstance(k, str)]
+            if keys and all(_looks_like_symbol(_norm_symbol(k)) for k in keys):
+                codes = keys
+
+    if not codes:
+        raise ValueError(
+            f"Could not find a list of crypto codes in {path}. "
+            "Expected a list[str] or a dict with a list under a known key."
+        )
+
+    # Normalize & de-dup
+    codes = sorted({_norm_symbol(c) for c in codes if isinstance(c, str) and c.strip()})
+    if not codes:
+        raise ValueError(f"Parsed codes from {path}, but they’re empty after normalization.")
+    return codes
+
+def find_symbol_column(df: pd.DataFrame) -> str:
+    """Find a symbol-like column, tolerant of casing & aliases."""
+    cols_lower = {c.lower(): c for c in df.columns}
+    for cand in ("symbol", "pair", "ticker"):
+        if cand in cols_lower:
+            return cols_lower[cand]
+    raise ValueError(f"No symbol/pair/ticker column in CSV. Columns: {list(df.columns)}")
+
+
+# --------------------------
+# Env factory
+# --------------------------
 def make_env(crypto_codes, historical_df):
     """
     Factory for a single BuyTrainingEnv instance wrapped with an action masker.
@@ -102,14 +131,18 @@ def make_env(crypto_codes, historical_df):
             history_window=HISTORY_WINDOW,
             lookahead_steps=LOOKAHEAD_STEPS,
             reward_mode=REWARD_MODE,
+            # You can pass chunking knobs here if desired (uses env defaults otherwise)
+            # chunk_dir="/home/jarred/git/ServoTrader/data/split_10k_chunks_ancient",
+            # chunk_size=10_000,
+            # start_chunk_index=0,
+            # enable_chunking=None,
         )
+
         # Mask all actions except BUY 1..N at every step
         def mask_fn(e):
-            # Try to use the env's own mask if available (future-proof)
             if hasattr(e, "_get_action_mask"):
                 return e._get_action_mask()
             mask = np.zeros(e.action_space.n, dtype=bool)
-            # 1..N enabled
             mask[1:1 + e.num_cryptos] = True
             return mask
 
@@ -117,33 +150,49 @@ def make_env(crypto_codes, historical_df):
     return _env_fn
 
 
+# --------------------------
+# Main
+# --------------------------
 def main():
     os.makedirs(MODEL_DIR, exist_ok=True)
     os.makedirs(LOG_DIR, exist_ok=True)
 
     print("[BuyPretrain] Loading crypto codes…")
-    with open(CODES_PATH, "r") as f:
-        crypto_codes = json.load(f)
+    crypto_codes = load_crypto_codes(CODES_PATH)
+    print(f"[BuyPretrain] Loaded {len(crypto_codes)} codes. Sample: {crypto_codes[:10]}")
 
     print("[BuyPretrain] Loading dataset…")
     historical_df = pd.read_csv(DATA_PATH)
 
+    # ---- Fast overlap sanity check before building the env ----
+    sym_col = find_symbol_column(historical_df)
+    csv_syms = sorted({_norm_symbol(s) for s in historical_df[sym_col].astype(str)})
+    overlap = sorted(set(crypto_codes) & set(csv_syms))
+    print(f"[BuyPretrain] CSV symbols: {len(csv_syms)} | JSON codes: {len(crypto_codes)} | Overlap: {len(overlap)}")
+    if not overlap:
+        print(f"[BuyPretrain] Sample CSV: {csv_syms[:10]}")
+        print(f"[BuyPretrain] Sample JSON: {crypto_codes[:10]}")
+        raise SystemExit(
+            "No overlap after normalization — check separators (/, -, _), case, and exchange naming (BTC vs XBT), "
+            "or ensure you paired the right JSON with the right CSV (ancient vs modern)."
+        )
+
+    # Narrow to the overlapping set so the env always initializes cleanly
+    crypto_codes = overlap
+
     print("[BuyPretrain] Building environment…")
-    # Vec stack: DummyVecEnv -> VecMonitor
     env = DummyVecEnv([make_env(crypto_codes, historical_df)])
     env = VecMonitor(env)
 
-    # PPO hyperparameters tuned for single-step episodes:
-    # - Slightly higher entropy to encourage broad exploration across symbols
-    # - Shorter n_steps since episodes terminate each step anyway
+    # PPO hyperparameters tuned for single-step episodes
     ppo_config = dict(
         learning_rate=5e-5,
         n_steps=256,                 # rollout length; fine even though episodes are single-step
         batch_size=64,
-        gamma=0.97,                  # modest discount; has minor effect with single-step episodes
+        gamma=0.97,                  # minor effect with single-step episodes
         gae_lambda=0.95,
         clip_range=0.2,
-        ent_coef=0.02,               # a bit higher to promote exploration across many BUYs
+        ent_coef=0.02,               # encourage exploration across many BUYs
         vf_coef=0.5,
         max_grad_norm=0.5,
         normalize_advantage=True,
