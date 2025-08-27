@@ -120,13 +120,13 @@ ppo_config = {
 }
 
 # --- Set this flag to True if continuing training ---
-CONTINUE_TRAINING = True
+CONTINUE_TRAINING = False
 
 if CONTINUE_TRAINING:
     # --- Load existing model ---
     model_cls = RecurrentPPO if USE_LSTM else MaskablePPO
     model = model_cls.load(
-        "/home/jarred/git/ServoTrader/models/ppo_servo_trader_squirtle",
+        "/home/jarred/git/ServoTrader/models/ppo_bulbasaur",
         env=env,
         tensorboard_log=ppo_config["tensorboard_log"],
         device=ppo_config["device"]
@@ -144,11 +144,11 @@ else:
 
 # --- Set up checkpointing ---
 checkpoint = CheckpointCallback(
-    save_freq=100_000, save_path="/home/jarred/git/ServoTrader/models/", name_prefix="ppo_servo_trader_squirtle"
+    save_freq=100_000, save_path="/home/jarred/git/ServoTrader/models/", name_prefix="ppo_squirtle"
 )   
 
 # --- Train model ---
-model.learn(total_timesteps=100_000, callback=checkpoint)
+model.learn(total_timesteps=1_000_000, callback=checkpoint)
 
 # Save the total number of timesteps completed during training
 actual_timesteps = model.num_timesteps  # Real number of steps — could be > 5000 due to n_steps batch rounding
@@ -186,4 +186,4 @@ with open(env_instance.log_path, "a") as f:
     f.write(json.dumps(training_summary) + "\n\n")
 
 # --- Save final model ---
-model.save("/home/jarred/git/ServoTrader/models/ppo_servo_trader_squirtle")
+model.save("/home/jarred/git/ServoTrader/models/ppo_squirtle")

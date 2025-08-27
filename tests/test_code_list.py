@@ -29,6 +29,6 @@ def check_crypto_csv_coverage(json_path, csv_folder_path):
 
 # Usage
 if __name__ == "__main__":
-    json_path = "/home/jarred/git/ServoTrader/servo_trader/config/crypto_codes.json"
+    json_path = "/home/jarred/git/ServoTrader/servo_trader/config/crypto_codes_modern.json"
     csv_folder = "/home/jarred/git/ServoTrader/data/individual_crypto_csvs_modern"
     check_crypto_csv_coverage(json_path, csv_folder)

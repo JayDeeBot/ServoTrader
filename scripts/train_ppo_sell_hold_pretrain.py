@@ -50,7 +50,6 @@ HELD_SELECTION   = "round_robin"       # "random" or "round_robin"
 REWARD_BOUNDED   = False               # if True, tanh-squash reward to [-1, 1]
 EPISODE_TIMEOUT  = 30                  # shape parity only; not used to truncate
 
-
 # --------------------------
 # Helpers (robust + normalized)
 # --------------------------
