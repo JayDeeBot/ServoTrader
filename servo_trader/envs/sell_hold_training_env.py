@@ -120,7 +120,14 @@ class SellHoldTrainingEnv(gym.Env):
         self._rebuild_lookups_and_tensors(self.raw_df, first_time=True)
 
         # --- Action/Observation spaces (unchanged shape semantics) ---
-        self.action_space = spaces.Discrete(1 + self.num_cryptos + 1)
+
+        # Action Space:
+        # 0              = Hold
+        # 1 to num_cryptos = Buy symbol[i-1]
+        # (1 + num_cryptos) = Sell
+        # (2 + num_cryptos) = Not Buy (special skip option, only valid at episode start)
+        self.action_space = spaces.Discrete(1 + self.num_cryptos + 2)
+
         obs_len = (
             self.history_window * self.num_cryptos * self.features_per_crypto
             + 2  # time_remaining, current_profit

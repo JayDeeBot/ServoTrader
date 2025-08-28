@@ -168,6 +168,7 @@ class AgentService:
         mask = np.zeros(core.action_space.n, dtype=bool)
         if core.active_crypto_index is None:
             mask[1:core.num_cryptos + 1] = True
+            mask[2 + core.num_cryptos] = True                 # Not Buy (skip)
         else:
             mask[0] = True
             mask[core.num_cryptos + 1] = True

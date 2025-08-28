@@ -1,13 +1,47 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-buy_training_env.py  (robust, chunking-enabled)
+buy_training_env.py  (robust, chunking-enabled, with Not-Buy action)
 
-Single-decision, buy-only PPO pretraining environment with:
+Single-decision PPO pretraining environment that chooses either:
+- BUY one crypto now (rank-based reward from future returns), or
+- NOT_BUY (reward based on whether *any* crypto would have risen).
+
+Key features
+------------
 - Canonical symbol normalization on BOTH config codes & CSV chunks
 - Tolerant detection of symbol column names (symbol/pair/ticker)
 - Periodic dataset chunk loading (e.g., every 10k episodes)
-- Rank-based reward from future returns
+- Rank-based reward from future returns for BUY actions
+- Not-Buy reward that is positive when *all* returns ≤ 0, negative when *any* return > 0
+- Thorough comments and docstrings for maintainability
+
+Author
+------
+Jarred Deluca
+
+License
+-------
+MIT License
+
+Copyright (c) 2025 Jarred Deluca
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the “Software”), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software is furnished to do so,
+subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 """
 
 from __future__ import annotations
@@ -46,6 +80,11 @@ def _ensure_symbol_column(df: pd.DataFrame) -> pd.DataFrame:
     """
     Ensure the dataframe has a 'symbol' column; accept 'pair'/'ticker' aliases.
     Lower-cases columns to be tolerant of casing.
+
+    Returns
+    -------
+    pd.DataFrame
+        Copy of the input with columns normalized and 'symbol_norm' added.
     """
     df = df.copy()
     df.columns = [c.strip().lower() for c in df.columns]
@@ -64,16 +103,32 @@ def _ensure_symbol_column(df: pd.DataFrame) -> pd.DataFrame:
 
 class BuyTrainingEnv(gym.Env):
     """
-    Single-decision, buy-only pretraining environment for PPO, with optional
-    periodic CSV chunk reloading (e.g., /.../split_10k_chunks_ancient/000.csv, 001.csv, ...).
+    Single-decision pretraining environment for PPO with optional periodic CSV
+    chunk reloading (e.g., /.../split_10k_chunks_ancient/000.csv, 001.csv, ...).
 
-    Action space:
-        0        : Hold  (masked illegal)
-        1..N     : Buy i (legal)
-        N+1      : Sell  (masked illegal)
+    Action space
+    ------------
+        0                 : Hold  (masked illegal)
+        1..N              : Buy i (legal)
+        N+1               : Sell  (masked illegal)
+        N+2 (2+num_cryptos): Not Buy (legal; the "skip" option)
 
-    Episode:
-        One decision per episode → immediate rank-based reward → done.
+    Episode semantics
+    -----------------
+    One decision per episode → immediate reward → done.
+
+    Rewards
+    -------
+    - BUY(i): rank-based reward derived from future returns over `lookahead_steps`.
+    - NOT_BUY:
+        * If ANY crypto's future return is > 0 → negative reward (you missed upside).
+        * If ALL cryptos' future returns are ≤ 0 → positive reward (you avoided losses).
+      By default, magnitudes scale with the “best missed” up-move or the average down-move.
+
+    Notes
+    -----
+    - The environment is designed to be simple and stable for pretraining policies
+      for entry selection; it complements separate HOLD/SELL pretraining.
     """
 
     metadata = {"render.modes": ["human"]}
@@ -85,13 +140,48 @@ class BuyTrainingEnv(gym.Env):
         episode_timeout: int = 30,
         history_window: int = 5,
         lookahead_steps: int = 30,
-        reward_mode: str = "zero_to_one",
+        reward_mode: str = "zero_to_one",  # affects BUY rank mapping
+        # --- Not-Buy reward mode: "magnitude" or "binary"
+        not_buy_mode: str = "magnitude",
+        not_buy_positive_cap: float = 1.0,
+        not_buy_negative_cap: float = 1.0,
         # --- Chunking knobs ---
         chunk_dir: str | None = "/home/jarred/git/ServoTrader/data/split_10k_chunks_ancient",
         chunk_size: int = 10_000,
         start_chunk_index: int = 0,          # index for the *initial* `data`
         enable_chunking: bool | None = None, # None => auto True if dir exists
     ):
+        """
+        Parameters
+        ----------
+        data : pd.DataFrame
+            Stacked OHLCV(+count) rows for multiple symbols with a 'symbol'/'pair'/'ticker' column.
+        crypto_codes : list[str]
+            Symbols to include (any of 'BTC/USDT', 'btc-usdt', 'BTCUSDT' accepted; normalized internally).
+        episode_timeout : int
+            Window for engineered features (affects rolling stats).
+        history_window : int
+            Number of past timesteps included in the observation.
+        lookahead_steps : int
+            Horizon used to compute future returns for rewards.
+        reward_mode : {"zero_to_one","minus_one_to_one"}
+            Mapping for BUY rank-based reward.
+        not_buy_mode : {"magnitude","binary"}
+            - "magnitude": +avg negative if all <= 0 else -max positive (clipped by caps).
+            - "binary": +1 if all <= 0 else -1 (still clipped by caps).
+        not_buy_positive_cap : float
+            Upper bound for positive Not-Buy reward.
+        not_buy_negative_cap : float
+            Lower bound (absolute) for negative Not-Buy penalty.
+        chunk_dir : str | None
+            Directory holding sequential CSV chunks named 000.csv, 001.csv, ...
+        chunk_size : int
+            Number of *episodes* between chunk reloads when chunking is enabled.
+        start_chunk_index : int
+            The starting chunk index corresponding to the initially supplied `data`.
+        enable_chunking : bool | None
+            If None, enable automatically when `chunk_dir` exists.
+        """
         super().__init__()
 
         # --- Config (normalize configured codes) ---
@@ -100,6 +190,11 @@ class BuyTrainingEnv(gym.Env):
         self.history_window = int(history_window)
         self.lookahead_steps = int(lookahead_steps)
         self.reward_mode = reward_mode
+
+        # Not-Buy behavior toggles
+        self.not_buy_mode = not_buy_mode
+        self.not_buy_positive_cap = float(not_buy_positive_cap)
+        self.not_buy_negative_cap = float(not_buy_negative_cap)
 
         # --- Chunking config/state ---
         self.chunk_dir = chunk_dir
@@ -114,10 +209,17 @@ class BuyTrainingEnv(gym.Env):
         self.raw_df = _ensure_symbol_column(data)
         self._rebuild_lookups_and_tensors(self.raw_df, first_time=True)
 
-        # --- Action/Observation spaces (unchanged shape semantics) ---
-        self.action_space = spaces.Discrete(1 + self.num_cryptos + 1)
-        obs_len = self.history_window * self.num_cryptos * self.features_per_crypto + 2 + (self.num_cryptos + 1)
+        # --- Action/Observation spaces ---
+        # Action Space indices:
+        # 0              = Hold (illegal/masked)
+        # 1..N           = Buy symbol[i-1] (legal)
+        # N+1            = Sell (illegal/masked)
+        # N+2            = Not Buy (legal)
+        self.NOT_BUY_INDEX = 2  # offset after 0(Hold) and 1..N(Buy) and one for Sell
+        self.action_space = spaces.Discrete(1 + self.num_cryptos + 2)
 
+        # Observation = flattened history + [time_remaining, current_profit] + held_one_hot (N+1)
+        obs_len = self.history_window * self.num_cryptos * self.features_per_crypto + 2 + (self.num_cryptos + 1)
         low = np.zeros(obs_len, dtype=np.float32)
         # allow negative profit slot (even though we keep it 0 here)
         low[-(self.num_cryptos + 1 + 1)] = -1.0
@@ -294,6 +396,13 @@ class BuyTrainingEnv(gym.Env):
         """
         Start a new single-decision episode; advances the local pointer by 1,
         wrapping safely so the history window is valid.
+
+        Returns
+        -------
+        obs : np.ndarray
+            Flattened observation vector.
+        info : dict
+            Contains the boolean 'action_mask'.
         """
         super().reset(seed=seed)
 
@@ -312,6 +421,14 @@ class BuyTrainingEnv(gym.Env):
     def step(self, action: int):
         """
         Single-decision step with periodic dataset rollover.
+
+        Logic
+        -----
+        - If action is illegal (masked), return 0, done=True.
+        - If action is BUY(i):
+            compute rank-based reward from future returns and finish.
+        - If action is NOT_BUY:
+            reward depends on whether any symbol rises over the lookahead window.
         """
         legal = self._get_action_mask()
         if action < 0 or action >= self.action_space.n or not legal[action]:
@@ -327,12 +444,14 @@ class BuyTrainingEnv(gym.Env):
 
             return obs, float(reward), terminated, truncated, {"action_mask": legal}
 
-        # Map action (1..N) -> symbol index [0..N-1]
-        chosen_idx = action - 1
-
-        # Rank reward from future returns
         future_returns = self._compute_future_returns(self.current_step, self.lookahead_steps)
-        reward = self._rank_to_reward(future_returns, chosen_idx, mode=self.reward_mode)
+
+        if action == (2 + self.num_cryptos):  # NOT_BUY
+            reward = self._not_buy_reward(future_returns, mode=self.not_buy_mode)
+        else:
+            # Map action (1..N) -> symbol index [0..N-1]
+            chosen_idx = action - 1
+            reward = self._rank_to_reward(future_returns, chosen_idx, mode=self.reward_mode)
 
         terminated, truncated = True, False
         obs = self._get_observation()
@@ -386,7 +505,10 @@ class BuyTrainingEnv(gym.Env):
     def _compute_future_returns(self, t: int, H: int) -> np.ndarray:
         """
         Per-symbol future return from t to t+H using RAW closes:
+
             r_i = (Close[t+H, i] - Close[t, i]) / Close[t, i]
+
+        NaNs/Infs are safely converted to 0.
         """
         t0 = t
         t1 = min(self.num_timesteps - 1, t + max(1, H))
@@ -401,6 +523,20 @@ class BuyTrainingEnv(gym.Env):
     def _rank_to_reward(self, returns: np.ndarray, chosen_idx: int, mode: str = "zero_to_one") -> float:
         """
         Convert rank among all symbols into a scalar reward.
+
+        Parameters
+        ----------
+        returns : np.ndarray
+            Vector of per-symbol future returns.
+        chosen_idx : int
+            Index of the chosen symbol (0..N-1).
+        mode : {"zero_to_one","minus_one_to_one"}
+            Mapping for rank → reward.
+
+        Returns
+        -------
+        float
+            Reward in [0,1] or [-1,1] depending on mode.
         """
         N = returns.shape[0]
         if N <= 1:
@@ -415,15 +551,70 @@ class BuyTrainingEnv(gym.Env):
             return (2.0 * (r / (N - 1))) - 1.0
         return r / (N - 1)
 
+    def _not_buy_reward(self, returns: np.ndarray, mode: str = "magnitude") -> float:
+        """
+        Reward for selecting NOT_BUY at the decision point.
+
+        Intuition
+        ---------
+        - If ANY asset would have gone up (return > 0), then skipping was a mistake → negative reward.
+        - If ALL assets would have gone down (returns ≤ 0), then skipping avoided losses → positive reward.
+
+        Modes
+        -----
+        "magnitude" (default):
+            - Positive case (all ≤ 0):  +mean(abs(negative returns))  (clipped to not_buy_positive_cap)
+            - Negative case (any > 0): -max(positive returns)         (clipped to -not_buy_negative_cap)
+        "binary":
+            - Positive case (all ≤ 0): +1
+            - Negative case (any > 0): -1
+          (Then each is clipped by the corresponding cap.)
+
+        Returns
+        -------
+        float
+            Scalar reward; sign indicates correctness of the NOT_BUY decision, magnitude reflects confidence.
+        """
+        any_up = np.any(returns > 0.0)
+
+        if mode == "binary":
+            if any_up:
+                return float(-min(self.not_buy_negative_cap, 1.0))
+            else:
+                return float(min(self.not_buy_positive_cap, 1.0))
+
+        # magnitude mode
+        pos = returns[returns > 0.0]
+        neg = returns[returns <= 0.0]
+
+        if any_up:
+            # Missed upside → penalty proportional to the best missed up-move.
+            penalty = float(np.max(pos)) if pos.size > 0 else 0.0
+            penalty = min(penalty, self.not_buy_negative_cap)  # cap magnitude
+            return -penalty
+        else:
+            # Correct skip → reward proportional to the average down-move avoided.
+            gain = float(np.mean(np.abs(neg))) if neg.size > 0 else 0.0
+            gain = min(gain, self.not_buy_positive_cap)  # cap magnitude
+            return gain
+
     # -------------------
     # Action mask helper
     # -------------------
     def _get_action_mask(self) -> np.ndarray:
         """
-        Only BUY actions (1..N) are legal.
+        Legal at the single decision:
+          - BUY actions (1..N)
+          - NOT_BUY action (N+2)
+        Illegal (masked):
+          - HOLD (0)
+          - SELL (N+1)
         """
         mask = np.zeros(self.action_space.n, dtype=bool)
+        # BUY range
         mask[1 : 1 + self.num_cryptos] = True
+        # NOT_BUY
+        mask[1 + self.num_cryptos + 1] = True  # index = 2 + num_cryptos
         return mask
 
     # -------------

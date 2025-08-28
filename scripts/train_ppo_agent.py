@@ -85,8 +85,9 @@ else:
         mask = np.zeros(env.action_space.n, dtype=bool)  # Start all as False
 
         if env.active_crypto_index is None:
-            # No crypto held → only Buy actions are legal
+            # No crypto held → only Buy and Not Buy actions are legal
             mask[1:env.num_cryptos + 1] = True
+            mask[2 + env.num_cryptos] = True                 # Not Buy (skip)
         else:
             # Crypto held → only Hold and Sell are legal
             mask[0] = True  # Hold
@@ -120,7 +121,7 @@ ppo_config = {
 }
 
 # --- Set this flag to True if continuing training ---
-CONTINUE_TRAINING = False
+CONTINUE_TRAINING = True
 
 if CONTINUE_TRAINING:
     # --- Load existing model ---
@@ -144,7 +145,7 @@ else:
 
 # --- Set up checkpointing ---
 checkpoint = CheckpointCallback(
-    save_freq=100_000, save_path="/home/jarred/git/ServoTrader/models/", name_prefix="ppo_squirtle"
+    save_freq=100_000, save_path="/home/jarred/git/ServoTrader/models/", name_prefix="ppo_charmander"
 )   
 
 # --- Train model ---
@@ -186,4 +187,4 @@ with open(env_instance.log_path, "a") as f:
     f.write(json.dumps(training_summary) + "\n\n")
 
 # --- Save final model ---
-model.save("/home/jarred/git/ServoTrader/models/ppo_squirtle")
+model.save("/home/jarred/git/ServoTrader/models/ppo_charmander")

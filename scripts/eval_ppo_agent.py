@@ -46,7 +46,7 @@ from servo_trader.envs.crypto_trading_env import CryptoTradingEnv
 # ==========================
 # Config
 # ==========================
-MODEL_PATH = "/home/jarred/git/ServoTrader/models/ppo_squirtle"   # .zip optional
+MODEL_PATH = "/home/jarred/git/ServoTrader/models/ppo_charmander"   # .zip optional
 CRYPTO_CODES_PATH = "/home/jarred/git/ServoTrader/servo_trader/config/crypto_codes_modern.json"
 DATA_DIR = "/home/jarred/git/ServoTrader/data/split_10k_chunks_modern"        # env will load 001.csv, 002.csv, ... automatically
 FIRST_CHUNK = "000.csv"                                                         # initial dataset for env ctor
@@ -83,6 +83,7 @@ def action_masks(env):
 
     if core.active_crypto_index is None:
         mask[1:core.num_cryptos + 1] = True  # buys
+        mask[2 + core.num_cryptos] = True # Not Buy (skip)
     else:
         mask[0] = True                         # hold
         mask[core.num_cryptos + 1] = True      # sell

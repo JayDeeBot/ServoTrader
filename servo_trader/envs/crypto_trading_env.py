@@ -103,10 +103,11 @@ class CryptoTradingEnv(gym.Env):
         self.num_timesteps, self.num_cryptos, self.features_per_crypto = self.data.shape # Use the total number of timesteps available in historical data
 
         # Action Space:
-        # 0 = Hold
-        # 1 to 100 = Buy symbol[i-1]
-        # 101 = Sell
-        self.action_space = spaces.Discrete(1 + self.num_cryptos + 1)
+        # 0              = Hold
+        # 1 to num_cryptos = Buy symbol[i-1]
+        # (1 + num_cryptos) = Sell
+        # (2 + num_cryptos) = Not Buy (special skip option, only valid at episode start)
+        self.action_space = spaces.Discrete(1 + self.num_cryptos + 2)
 
         # Observation Space: 
         # Recent OHLCV (Open, High, Low, Close, Volume, vwap & count 
@@ -353,9 +354,20 @@ class CryptoTradingEnv(gym.Env):
         reward = 0
         done = False
         profit = 0
+        truncated = False
+        not_buy_termination = False
+        timeout_termination = False
+        
+        # If the action is Not Buy - index = 2 + num_cryptos (special skip option)
+        if action == (2 + self.num_cryptos):  
+            # End the episode immediately with a small fixed penalty
+            reward = -0.01  # Penalty for skipping the episode
+            self._end_episode() # End the episode
+            done = True   # Episode ends due to Not Buy
+            not_buy_termination = True # Flag for Not Buy termination
 
         # If the action is Buy - Buy Action range is 1:num_cryptos (for #num_cryptos cryptos)
-        if 1 <= action <= self.num_cryptos:  # Buy crypto[i]
+        elif 1 <= action <= self.num_cryptos:  # Buy crypto[i]
             if self.active_crypto_index is None: # Check whether we already holding a crypto - prevents double buying
                 self.active_crypto_index = action - 1 # Set active crypto index - Adjust index by -1 to match 0-based indexing
                 self.buy_price = self.data[self.current_step, self.active_crypto_index, 3] # Capture buy price at the current step from the close feature (index 3)
@@ -390,14 +402,31 @@ class CryptoTradingEnv(gym.Env):
                     profit = (sell_price - self.buy_price) / self.buy_price
                 self.portfolio_value *= (1 + profit) # Calculate the final portfolio value
                 reward = self._calculate_reward(profit,"SELL") # Calculate the final reward for the episode
+                # Capture raw index/symbol now (before end_episode and before step advances)
+                sell_symbol = self.crypto_codes[self.active_crypto_index]
+                sell_raw_index = None
+                if sell_symbol in self.raw_lookup:
+                    try:
+                        sell_raw_index = int(self.raw_lookup[sell_symbol].index[self.current_step])
+                    except Exception:
+                        sell_raw_index = None
+
+                self._last_sell_context = {
+                    "symbol": sell_symbol,
+                    "buy_price": self.buy_price,
+                    "sell_price": sell_price,
+                    "profit": profit * 100.0,
+                    "raw_index": sell_raw_index,
+                }
                 self._end_episode() # End the episode
                 done = True # Reset done flag
             else: # If we are not holding a crypto then give a small negative reward - teaches the agent the legal moves
                 reward = -0.1  # Penalty: nothing to sell
 
         # If we have exceeded the timout steps for this episode
-        if self.global_step - self.start_step >= self.timeout_steps: # Check whether we have exceeded the timeout steps for this episode
+        if not done and (self.global_step - self.start_step) >= self.timeout_steps: # Check whether we have exceeded the timeout steps for this episode
             done = True # Reset done flag
+            timeout_termination = True # Flag for timeout termination
             if self.active_crypto_index is not None: # Check whether there is an active crypto
                 symbol = self.crypto_codes[self.active_crypto_index] # Grab the active symbol we are selling
                 final_price = self.data[self.current_step, self.active_crypto_index, 3] # Grab the final price
@@ -477,12 +506,14 @@ class CryptoTradingEnv(gym.Env):
             obs = np.nan_to_num(obs, nan=0.0, posinf=1e6, neginf=-1e6)
 
         terminated = done # Terminated & done will be the same for our application
-        truncated = (self.global_step - self.start_step) >= self.timeout_steps # Truncated is true if the total steps of the episode exceeds the timeout steps
+        truncated = timeout_termination # Truncated is true if the total steps of the episode exceeds the timeout steps
         info = {}
         # Log the reason the episode ended
         # if terminated:
-        #     if truncated:
+        #     if timeout_termination:
         #         print(f"[Env] Episode ended due to timeout at step {self.global_step - self.start_step} (relative to episode start)")
+        #     elif not_buy_termination:
+        #         print(f"[Env] Episode ended due to Not Buy at step {self.global_step - self.start_step} (relative to episode start)")
         #     else:
         #         print(f"[Env] Episode terminated due to sell at step {self.global_step - self.start_step} (relative to episode start)")
 
@@ -494,7 +525,7 @@ class CryptoTradingEnv(gym.Env):
         profit = None              # Profit percentage
         raw_price = None           # Raw close price
         raw_buy_price = None       # Buy price from raw data
-        raw_sell_price = None      # Sell price from raw data
+        # raw_sell_price = None      # Sell price from raw data
 
         # If currently holding a crypto, compute prices and profit
         if self.active_crypto_index is not None:
@@ -518,8 +549,13 @@ class CryptoTradingEnv(gym.Env):
             step_event["price"] = raw_price if raw_price is not None else current_price
             step_event["profit_pct"] = float(profit)
 
+        # --- NOT_BUY action logging ---
+        if action == (2 + self.num_cryptos):
+            step_event["action_type"] = "not_buy"
+            step_event["note"] = "Episode skipped at start with penalty"
+
         # --- BUY action logging ---
-        if 1 <= action <= self.num_cryptos:
+        elif 1 <= action <= self.num_cryptos:
             buy_symbol = self.crypto_codes[action - 1]
             if buy_symbol in self.raw_lookup:
                 raw_buy_price = float(self.raw_lookup[buy_symbol].iloc[self.current_step]["close"])
@@ -530,24 +566,22 @@ class CryptoTradingEnv(gym.Env):
         # --- SELL action logging ---
         elif action == self.num_cryptos + 1 and hasattr(self, "_last_sell_context"):
             ctx = self._last_sell_context
-            sell_symbol = ctx["symbol"]
-            if sell_symbol in self.raw_lookup:
-                raw_sell_price = float(self.raw_lookup[sell_symbol].iloc[self.current_step]["close"])
             step_event["action_type"] = "sell"
-            step_event["symbol"] = sell_symbol
+            step_event["symbol"] = ctx["symbol"]
             step_event["buy_price"] = float(ctx["buy_price"])
-            step_event["sell_price"] = raw_sell_price if raw_sell_price is not None else float(ctx["sell_price"])
+            step_event["sell_price"] = float(ctx["sell_price"])
             step_event["profit_pct"] = float(ctx["profit"])
-            del self._last_sell_context  # Cleanup context after logging
+            if ctx.get("raw_index") is not None:
+                step_event["raw_index"] = int(ctx["raw_index"])
+            del self._last_sell_context  # Clear context after logging
 
         # --- HOLD or fallback logging ---
         else:
             step_event["action_type"] = "hold" if action == 0 else "unknown"
 
         # --- Add raw_index for test alignment ---
-        if step_event.get("symbol") and step_event["symbol"] in self.raw_lookup:
-            raw_idx = int(self.raw_lookup[step_event["symbol"]].index[self.current_step])
-            step_event["raw_index"] = raw_idx
+        if "raw_index" not in step_event and step_event.get("symbol") and step_event["symbol"] in self.raw_lookup:
+            step_event["raw_index"] = int(self.raw_lookup[step_event["symbol"]].index[self.current_step])
 
         # Append the structured step log
         self.episode_log.append(step_event)
@@ -565,7 +599,7 @@ class CryptoTradingEnv(gym.Env):
                 "steps": episode_steps,
                 "final_value": float(self.portfolio_value),
                 "episode_return_pct": percent_return,
-                "termination": "timeout" if truncated else "sell",
+                "termination": "timeout" if timeout_termination else ("no_buy" if not_buy_termination else "sell"),
                 "timestamp": datetime.now().isoformat()
             }
 
@@ -585,11 +619,15 @@ class CryptoTradingEnv(gym.Env):
 
         # Compute legal action mask
         action_mask = np.zeros(self.action_space.n, dtype=bool)
+
         if self.active_crypto_index is None:
-            action_mask[1:self.num_cryptos + 1] = True  # Buy actions
+            # No crypto currently held → can Buy any symbol or skip the episode (NOT_BUY)
+            action_mask[1:self.num_cryptos + 1] = True               # Buy actions
+            action_mask[2 + self.num_cryptos] = True                 # Not Buy (skip)
         else:
-            action_mask[0] = True  # Hold
-            action_mask[self.num_cryptos + 1] = True  # Sell
+            # Already holding → only Hold or Sell are valid
+            action_mask[0] = True                                    # Hold
+            action_mask[self.num_cryptos + 1] = True                 # Sell
 
         info["action_mask"] = action_mask
 
@@ -731,7 +769,9 @@ class CryptoTradingEnv(gym.Env):
 
         if self.active_crypto_index is None:
             # No crypto held: enable only buy actions (1 to num_cryptos)
+            # Not Buy (skip) action also enabled
             mask[1:self.num_cryptos + 1] = True
+            mask[2 + self.num_cryptos] = True                 
         else:
             # Crypto held: enable only hold (0) and sell (num_cryptos + 1)
             mask[0] = True

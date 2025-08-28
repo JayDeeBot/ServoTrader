@@ -153,10 +153,11 @@ class LiveCryptoTradingEnv(gym.Env):
         self.features_per_crypto = 13 # Set total amount of features for calculating the size of the observation
 
         # Action Space:
-        # 0 = Hold
-        # 1 to 100 = Buy symbol[i-1]
-        # 101 = Sell
-        self.action_space = spaces.Discrete(1 + self.num_cryptos + 1)
+        # 0              = Hold
+        # 1 to num_cryptos = Buy symbol[i-1]
+        # (1 + num_cryptos) = Sell
+        # (2 + num_cryptos) = Not Buy (special skip option, only valid at episode start)
+        self.action_space = spaces.Discrete(1 + self.num_cryptos + 2)
 
         # Observation Space: 
         # Recent 13 (see above) features for 100 cryptos
@@ -471,9 +472,17 @@ class LiveCryptoTradingEnv(gym.Env):
                     )
                     done = True # Set the done flag to true - episode is overs
 
+        ### ----- NOT BUY ACTION ----- ###
+        # If the action is Not Buy - index = 2 + num_cryptos (special skip option)
+        elif action == (2 + self.num_cryptos):  
+            # End the episode immediately with a small fixed penalty
+            reward = -0.01  # Penalty for skipping the episode
+            done = True   # Episode ends due to Not Buy
+            self._log_step(action=action, action_type="not_buy", reward=reward) # Log Not Buy action
+
         ### ----- BUY ACTION ----- ###
         # If the action is Buy - Buy Action range is 1:num_cryptos (for #num_cryptos cryptos)
-        if 1 <= action <= self.num_cryptos:  # Buy crypto[i]
+        elif 1 <= action <= self.num_cryptos:  # Buy crypto[i]
             if self.active_crypto_index is None: # Check whether we already holding a crypto - prevents double buying
                 self.active_crypto_index = action - 1 # Set active crypto index - Adjust index by -1 to match 0-based indexing
                 self.active_crypto_code = self._get_buy_action_code(action) # Save the active crypto code
@@ -611,7 +620,8 @@ class LiveCryptoTradingEnv(gym.Env):
         # Compute legal action mask
         action_mask = np.zeros(self.action_space.n, dtype=bool)
         if self.active_crypto_index is None:
-            action_mask[1:self.num_cryptos + 1] = True  # Buy actions
+            action_mask[1:self.num_cryptos + 1] = True # Buy actions
+            action_mask[2 + self.num_cryptos] = True # Not Buy (skip)
         else:
             action_mask[0] = True  # Hold
             action_mask[self.num_cryptos + 1] = True  # Sell
@@ -789,6 +799,8 @@ class LiveCryptoTradingEnv(gym.Env):
         if self.active_crypto_index is None:
             # No crypto held: enable only buy actions (1 to num_cryptos)
             mask[1:self.num_cryptos + 1] = True
+            # Not Buy (skip) action also enabled
+            mask[2 + self.num_cryptos] = True                 # Not Buy (skip)
         else:
             # Crypto held: enable only hold (0) and sell (num_cryptos + 1)
             mask[0] = True

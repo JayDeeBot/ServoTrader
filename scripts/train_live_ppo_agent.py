@@ -87,6 +87,7 @@ def action_masks(env):
 
     if core.active_crypto_index is None:
         mask[1:core.num_cryptos + 1] = True     # BUY actions
+        mask[2 + core.num_cryptos] = True                 # Not Buy (skip)
         # Optional: also allow HOLD while flat:
         # mask[0] = True
     else:

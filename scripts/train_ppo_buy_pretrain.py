@@ -4,6 +4,11 @@
 train_ppo_buy_pretrain.py
 
 PPO pretraining script for BuyTrainingEnv (single-decision, buy-only ranking env).
+
+- Run `tensorboard --logdir /home/jarred/git/ServoTrader/logs --port 6006` to visualize training
+- To view logs go to '[http://localhost:6006](http://localhost:6006)'
+- Set CONTINUE_TRAINING to True to resume from a saved model
+
 """
 
 # scripts/train_ppo_buy_pretrain.py
@@ -37,7 +42,7 @@ DATA_PATH  = "/home/jarred/git/ServoTrader/data/split_10k_chunks_ancient/000.csv
 
 MODEL_DIR  = "/home/jarred/git/ServoTrader/models"
 LOG_DIR    = "/home/jarred/git/ServoTrader/logs"
-MODEL_NAME = "ppo_buy_pretrain_bulbasaur"
+MODEL_NAME = "ppo_charmander"
 
 TOTAL_TIMESTEPS   = 1_000_000
 CHECKPOINT_EVERY  = 100_000
@@ -144,6 +149,7 @@ def make_env(crypto_codes, historical_df):
                 return e._get_action_mask()
             mask = np.zeros(e.action_space.n, dtype=bool)
             mask[1:1 + e.num_cryptos] = True
+            mask[2 + e.num_cryptos] = True                 # Not Buy (skip)
             return mask
 
         return ActionMasker(env, mask_fn)

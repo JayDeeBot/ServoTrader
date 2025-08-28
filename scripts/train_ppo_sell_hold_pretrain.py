@@ -37,7 +37,7 @@ DATA_PATH  = "/home/jarred/git/ServoTrader/data/split_10k_chunks_ancient/000.csv
 
 MODEL_DIR  = "/home/jarred/git/ServoTrader/models"
 LOG_DIR    = "/home/jarred/git/ServoTrader/logs"
-MODEL_NAME = "ppo_bulbasaur"
+MODEL_NAME = "ppo_charmander"   # choose a name for your model
 
 TOTAL_TIMESTEPS   = 1_000_000          # adjust as needed
 CHECKPOINT_EVERY  = 100_000            # steps per checkpoint

@@ -129,6 +129,7 @@ def action_masks(env):
     if core.active_crypto_index is None:
         # No crypto held → only Buy actions are legal
         mask[1:core.num_cryptos + 1] = True
+        mask[2 + core.num_cryptos] = True                 # Not Buy (skip)
         # Optional: allow HOLD while flat (uncomment if desired)
         # mask[0] = True
     else:
