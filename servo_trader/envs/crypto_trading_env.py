@@ -64,7 +64,7 @@ class CryptoTradingEnv(gym.Env):
     metadata = {'render.modes': ['human']}
 
     
-    def __init__(self, data, crypto_codes, episode_timeout=30):
+    def __init__(self, data, crypto_codes, episode_timeout=120):
         super(CryptoTradingEnv, self).__init__()
         """
         Constructor for CryptoTradingEnvironemnt.

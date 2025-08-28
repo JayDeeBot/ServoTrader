@@ -55,7 +55,7 @@ from servo_trader.envs.live_crypto_trading_env import LiveCryptoTradingEnv
 # -----------------------------
 # Config via environment
 # -----------------------------
-MODEL_PATH         = os.getenv("MODEL_PATH", "/app/models/ppo_servo_trader_squirtle.zip")
+MODEL_PATH         = os.getenv("MODEL_PATH", "/app/models/ppo_charmander.zip")
 CRYPTO_CODES_PATH  = os.getenv("CRYPTO_CODES_PATH", "/app/config/crypto_codes.json")
 PARAMS_PATH        = os.getenv("PARAMS_PATH", "/app/config/params.yaml")
 DATA_DIR           = os.getenv("DATA_DIR", "/app/data")
@@ -168,7 +168,7 @@ class AgentService:
         mask = np.zeros(core.action_space.n, dtype=bool)
         if core.active_crypto_index is None:
             mask[1:core.num_cryptos + 1] = True
-            mask[2 + core.num_cryptos] = True                 # Not Buy (skip)
+            mask[2 + core.num_cryptos] = True
         else:
             mask[0] = True
             mask[core.num_cryptos + 1] = True

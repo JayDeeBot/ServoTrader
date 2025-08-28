@@ -23,7 +23,7 @@ services:
 
     environment:
       # Paths (container-side)
-      - MODEL_PATH=/app/models/ppo_servo_trader_squirtle.zip
+      - MODEL_PATH=/app/models/ppo_charmander.zip
       - CRYPTO_CODES_PATH=/app/config/crypto_codes.json
       - PARAMS_PATH=/app/config/params.yaml
       - DATA_DIR=/app/data
