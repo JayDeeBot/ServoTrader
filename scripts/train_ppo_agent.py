@@ -127,7 +127,7 @@ if CONTINUE_TRAINING:
     # --- Load existing model ---
     model_cls = RecurrentPPO if USE_LSTM else MaskablePPO
     model = model_cls.load(
-        "/home/jarred/git/ServoTrader/models/ppo_bulbasaur",
+        "/home/jarred/git/ServoTrader/models/ppo_charmander",
         env=env,
         tensorboard_log=ppo_config["tensorboard_log"],
         device=ppo_config["device"]
@@ -145,7 +145,7 @@ else:
 
 # --- Set up checkpointing ---
 checkpoint = CheckpointCallback(
-    save_freq=100_000, save_path="/home/jarred/git/ServoTrader/models/", name_prefix="ppo_charmander"
+    save_freq=100_000, save_path="/home/jarred/git/ServoTrader/models/", name_prefix="ppo_charmeleon"
 )   
 
 # --- Train model ---
@@ -187,4 +187,4 @@ with open(env_instance.log_path, "a") as f:
     f.write(json.dumps(training_summary) + "\n\n")
 
 # --- Save final model ---
-model.save("/home/jarred/git/ServoTrader/models/ppo_charmander")
+model.save("/home/jarred/git/ServoTrader/models/ppo_charmeleon")

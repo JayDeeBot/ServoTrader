@@ -52,7 +52,7 @@ DATA_DIR = "/home/jarred/git/ServoTrader/data/split_10k_chunks_modern"        # 
 FIRST_CHUNK = "000.csv"                                                         # initial dataset for env ctor
 
 EVAL_STEPS = 100_000          # total environment steps to evaluate
-EPISODE_TIMEOUT = 30          # minutes per episode (match training if needed)
+EPISODE_TIMEOUT = 120          # minutes per episode (match training if needed)
 USE_LSTM = False              # set True ONLY if the saved model is RecurrentPPO
 DEBUG_MASK = False            # print mask diagnostics occasionally
 
