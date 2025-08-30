@@ -1,5 +1,39 @@
 # 🚀 ServoTrader Deployment Guide (DigitalOcean)
 
+## Pre-requisites 
+
+1. Build the container with Docker:
+
+```bash
+docker compose build
+```
+
+2. Run the container to test:
+
+```bash
+docker compose up -d
+```
+
+3. Check the logs:
+
+```bash
+docker compose logs -f
+```
+
+4. Stop the container:
+
+```bash
+docker compose down
+```
+
+5. Push the container to docker:
+
+```bash
+docker login
+docker build -t jaydeebot/servotrader:latest .
+docker push jaydeebot/servotrader:latest
+```
+
 ## 1. Create the Droplet
 - Provider: **DigitalOcean**
 - Recommended size: `2 GB RAM` minimum (upgrade if OOM issues).
@@ -7,7 +41,7 @@
 
 SSH into the server:
 ```bash
-ssh root@<YOUR_DROPLET_IP>
+ssh root@<143.198.195.92>
 ```
 
 ---
@@ -35,7 +69,7 @@ mkdir -p /srv/servotrader/{config,data,logs,models}
 File: `/srv/servotrader/.env`
 
 ```env
-MODEL_PATH=/app/models/ppo_servo_trader_squirtle.zip
+MODEL_PATH=/app/models/ppo_bulbasaur.zip
 CRYPTO_CODES_PATH=/app/config/crypto_codes.json
 PARAMS_PATH=/app/config/params.yaml
 DATA_DIR=/app/data
@@ -54,9 +88,9 @@ BINANCE_TESTNET=false
 ## 5. Upload Config + Model
 From your local machine:
 ```bash
-scp ./config/crypto_codes.json root@<DROPLET_IP>:/srv/servotrader/config/
-scp ./config/params.yaml root@<DROPLET_IP>:/srv/servotrader/config/
-scp -r ./models root@<DROPLET_IP>:/srv/servotrader/
+scp ./servo_trader/config/crypto_codes.json root@143.198.195.92:/srv/servotrader/config/
+scp ./servo_trader/config/params.yaml root@143.198.195.92:/srv/servotrader/config/
+scp -r ./models root@143.198.195.92:/srv/servotrader/
 ```
 
 ---
@@ -87,6 +121,10 @@ free -h
 
 ## 8. Run the Container
 ```bash
+docker login
+
+docker pull jaydeebot/servotrader-live:latest
+
 docker run -d --name servotrader   --restart unless-stopped   --env-file /srv/servotrader/.env   -v /srv/servotrader/config:/app/config   -v /srv/servotrader/data:/app/data   -v /srv/servotrader/logs:/app/logs   -v /srv/servotrader/models:/app/models   -v /srv/servotrader/logs:/home/jarred/git/ServoTrader/logs   -v /srv/servotrader/data:/home/jarred/git/ServoTrader/data   -p 80:8080   jaydeebot/servotrader-live:latest
 ```
 
@@ -111,7 +149,7 @@ Step should increment every few seconds.
 ## 10. Access Web UI
 Open in browser:
 ```
-http://<YOUR_DROPLET_IP>
+http://<143.198.195.92>
 ```
 
 ---

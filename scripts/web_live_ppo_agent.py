@@ -18,12 +18,12 @@ Also:
 - Robust JSON serialization for NumPy & datetimes
 
 Env vars:
-    MODEL_PATH=/app/models/ppo_servo_trader_squirtle.zip
+    MODEL_PATH=/app/models/ppo_servo_trader_bulbasaur.zip
     CRYPTO_CODES_PATH=/app/config/crypto_codes.json
     PARAMS_PATH=/app/config/params.yaml
     DATA_DIR=/app/data
     LOG_DIR=/app/logs
-    EPISODE_TIMEOUT=120
+    EPISODE_TIMEOUT=30
     WEB_HOST=0.0.0.0
     WEB_PORT=8080
     DEBUG_MASK=0
@@ -55,12 +55,12 @@ from servo_trader.envs.live_crypto_trading_env import LiveCryptoTradingEnv
 # -----------------------------
 # Config via environment
 # -----------------------------
-MODEL_PATH         = os.getenv("MODEL_PATH", "/app/models/ppo_servo_trader_squirtle.zip")
+MODEL_PATH         = os.getenv("MODEL_PATH", "/app/models/ppo_bulbasaur.zip")
 CRYPTO_CODES_PATH  = os.getenv("CRYPTO_CODES_PATH", "/app/config/crypto_codes.json")
 PARAMS_PATH        = os.getenv("PARAMS_PATH", "/app/config/params.yaml")
 DATA_DIR           = os.getenv("DATA_DIR", "/app/data")
 LOG_DIR            = os.getenv("LOG_DIR", "/app/logs")
-EPISODE_TIMEOUT    = int(os.getenv("EPISODE_TIMEOUT", "120"))
+EPISODE_TIMEOUT    = int(os.getenv("EPISODE_TIMEOUT", "30"))
 WEB_HOST           = os.getenv("WEB_HOST", "0.0.0.0")
 WEB_PORT           = int(os.getenv("WEB_PORT", "8080"))
 DEBUG_MASK         = os.getenv("DEBUG_MASK", "0") == "1"
