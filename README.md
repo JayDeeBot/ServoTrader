@@ -87,6 +87,20 @@ Created by [Jarred Deluca](mailto:jarred.g.deluca@student.uts.edu.au)
 
 ## TODO List
 
-1. Create preliminary training environment(s)
-    (a) Buy Training: At each episode attempt the agent makes a buy decision attempting to select the crypto code that will increase at the greatest rate at the next timestep. Rewards are shaped accordingly.
-    (b) Hold/Sell Training: At each episode the agent is asked to make a Hold/Sell decision about a crypto held for a given observation. If Hold; positive rewards are awarded if the value increases, negative if it decreases; if Sell; inverse rewards.
+1. Test LSTM in small training sessions and evaluate the models.
+2. Adjust the price selection in the crypto training environment to make it more stringent:
+    (a) Buy Price = High @ step
+    (b) Hold price = Low @ step
+    (c) Sell price = Low @ step - epsilon (where e = some small value)
+3. Repair the live trading env and scripts so that the logging is accurate, areas to repair:
+    (a) The sell price
+    (b) Episode return
+    (c) Overall return
+    (d) Average daily return
+4. Review the buy and sell/hold training environments;
+    (a) Buy:
+        (i) The highest reward should be given to the buy decision that within the next 60 minutes will achieve the most profit
+    (b) Sell/Hold:
+        (i) Hold - Rewards should be positive if the crypto increases and negative if it decreases.
+        (ii) Sell - Inverse of hold.
+5. Download additional datasets for different cryptos - 2 more data sets of 100 new cryptos each. Attempt further training on the bulbasaur model and evaluate to determine whether the model has improved performance. 
