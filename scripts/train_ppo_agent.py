@@ -58,12 +58,12 @@ print("Loading initial dataset...")
 historical_df = pd.read_csv("/home/jarred/git/ServoTrader/data/split_10k_chunks_ancient/000.csv")
 
 # --- Create environment ---
-USE_LSTM = False  # Set to False to use MaskablePPO instead
+USE_LSTM = True  # Set to False to use MaskablePPO instead
 
 if USE_LSTM:
     # --- New method: RecurrentPPO with LSTMActionMaskWrapper ---
     env = DummyVecEnv([
-        lambda: CryptoTradingEnv(data=historical_df, crypto_codes=crypto_codes, episode_timeout=15)
+        lambda: CryptoTradingEnv(data=historical_df, crypto_codes=crypto_codes, episode_timeout=60)
     ])
     env = VecMonitor(env)
     env.envs[0] = LSTMActionMaskWrapper(env.envs[0], model=None)  # Model injected later
@@ -96,7 +96,7 @@ else:
 
     env = DummyVecEnv([
         lambda: ActionMasker(
-            CryptoTradingEnv(data=historical_df, crypto_codes=crypto_codes, episode_timeout=15),
+            CryptoTradingEnv(data=historical_df, crypto_codes=crypto_codes, episode_timeout=60),
             action_masks
         )
     ])
@@ -120,7 +120,7 @@ ppo_config = {
 }
 
 # --- Set this flag to True if continuing training ---
-CONTINUE_TRAINING = True
+CONTINUE_TRAINING = False
 
 if CONTINUE_TRAINING:
     # --- Load existing model ---
@@ -144,11 +144,11 @@ else:
 
 # --- Set up checkpointing ---
 checkpoint = CheckpointCallback(
-    save_freq=100_000, save_path="/home/jarred/git/ServoTrader/models/", name_prefix="ppo_ivysaur"
+    save_freq=100_000, save_path="/home/jarred/git/ServoTrader/models/", name_prefix="ppo_dratini"
 )   
 
 # --- Train model ---
-model.learn(total_timesteps=1_000_000, callback=checkpoint)
+model.learn(total_timesteps=100_000, callback=checkpoint)
 
 # Save the total number of timesteps completed during training
 actual_timesteps = model.num_timesteps  # Real number of steps — could be > 5000 due to n_steps batch rounding
@@ -186,4 +186,4 @@ with open(env_instance.log_path, "a") as f:
     f.write(json.dumps(training_summary) + "\n\n")
 
 # --- Save final model ---
-model.save("/home/jarred/git/ServoTrader/models/ppo_ivysaur")
+model.save("/home/jarred/git/ServoTrader/models/ppo_dratini")

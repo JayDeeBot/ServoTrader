@@ -64,7 +64,7 @@ class CryptoTradingEnv(gym.Env):
     metadata = {'render.modes': ['human']}
 
     
-    def __init__(self, data, crypto_codes, episode_timeout=30):
+    def __init__(self, data, crypto_codes, episode_timeout=60):
         super(CryptoTradingEnv, self).__init__()
         """
         Constructor for CryptoTradingEnvironemnt.
@@ -94,7 +94,7 @@ class CryptoTradingEnv(gym.Env):
         self.portfolio_value = self.cash_balance # Total portfolio value at each time step
         self.break_even_steps = 0 # Member to track how long we've been near break-even after a buy has been made
         self.feature_window = episode_timeout # Window used for computing additional features when pre-processing data
-        self.history_window = 5  # Number of past timesteps to include in observation
+        self.history_window = 1  # Number of past timesteps to include in observation
 
         # Store symbol list, preprocess raw dataframe
         self.crypto_codes = sorted(crypto_codes)

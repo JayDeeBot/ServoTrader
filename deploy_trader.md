@@ -41,7 +41,7 @@ docker push jaydeebot/servotrader:latest
 
 SSH into the server:
 ```bash
-ssh root@<143.198.195.92>
+ssh root@143.198.195.92
 ```
 
 ---
@@ -149,7 +149,20 @@ Step should increment every few seconds.
 ## 10. Access Web UI
 Open in browser:
 ```
-http://<143.198.195.92>
+http://143.198.195.92
+```
+
+## 11. Stop the App
+
+### First get the Container ID
+```
+docker ps
+```
+
+### Then use the stop command
+```
+docker stop <container_id>
+docker rm servotrader
 ```
 
 ---
