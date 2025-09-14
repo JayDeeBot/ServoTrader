@@ -6,8 +6,8 @@ from tqdm import tqdm
 import time
 
 # --- Config ---
-INPUT_PATH = "/home/jarred/git/ServoTrader/data/modern_historical_crypto_data.csv"
-OUTPUT_DIR = "/home/jarred/git/ServoTrader/data/split_10k_chunks_modern"
+INPUT_PATH = "/home/jarred/git/ServoTrader/data/ancient_historical_crypto_data_2.csv"
+OUTPUT_DIR = "/home/jarred/git/ServoTrader/data/split_10k_chunks_ancient_2"
 CHUNK_SIZE = 10_000
 LINES_PER_SYMBOL = 1_000_000  # assumption
 

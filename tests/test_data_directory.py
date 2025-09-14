@@ -17,5 +17,5 @@ def count_csv_files_and_lines(folder_path):
 
 # Usage
 if __name__ == "__main__":
-    folder = "/home/jarred/git/ServoTrader/data/individual_crypto_csvs"
+    folder = "/home/jarred/git/ServoTrader/data/individual_crypto_csvs_ancient_2"
     count_csv_files_and_lines(folder)
