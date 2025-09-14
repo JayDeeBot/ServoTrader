@@ -10,7 +10,7 @@ BINANCE_API_KEY = "6BZOFxkzIau3dqljZu8tbbKY5tZxnptRJkOfHq6Nx5jZDbvogxseqFkaQ3Rnu
 BINANCE_SECRET = "6vguZphjUuW9t6SdPZUxImWNzB2anPr91jAWHw9dwIASLeFAVnbQQMZi0iZVBdru"
 CODES_JSON_PATH = "/home/jarred/git/ServoTrader/servo_trader/config/crypto_code_sundries.json"
 FULL_DATASET_CSV = "/home/jarred/git/ServoTrader/data/large_historical_dataset.csv"
-INDIVIDUAL_FOLDER = "/home/jarred/git/ServoTrader/data/individual_crypto_csvs"
+INDIVIDUAL_FOLDER = "/home/jarred/git/ServoTrader/data/individual_crypto_csvs_ancient_2"
 INTERVAL = '1m'
 START_DATE = '2021-01-01T00:00:00Z'
 MAX_CANDLES = 1_000_000
@@ -95,19 +95,19 @@ for i, symbol in enumerate(crypto_codes):
     eta = timedelta(seconds=int(estimated_total_time - elapsed))
     print(f"📊 Progress: {percent:.2f}% complete | ETA: {eta}")
 
-# --- SAVE FINAL COMBINED DATASET ---
-print("\n📦 Concatenating all individual CSVs from disk...")
+# # --- SAVE FINAL COMBINED DATASET ---
+# print("\n📦 Concatenating all individual CSVs from disk...")
 
-csv_paths = [os.path.join(INDIVIDUAL_FOLDER, f) for f in os.listdir(INDIVIDUAL_FOLDER) if f.endswith(".csv")]
-dataframes = []
-for path in csv_paths:
-    try:
-        df = pd.read_csv(path, parse_dates=['timestamp'])
-        dataframes.append(df)
-    except Exception as e:
-        print(f"⚠️ Skipped {path} due to read error: {e}")
+# csv_paths = [os.path.join(INDIVIDUAL_FOLDER, f) for f in os.listdir(INDIVIDUAL_FOLDER) if f.endswith(".csv")]
+# dataframes = []
+# for path in csv_paths:
+#     try:
+#         df = pd.read_csv(path, parse_dates=['timestamp'])
+#         dataframes.append(df)
+#     except Exception as e:
+#         print(f"⚠️ Skipped {path} due to read error: {e}")
 
-final_df = pd.concat(dataframes, ignore_index=True)
-final_df.to_csv(FULL_DATASET_CSV, index=False)
+# final_df = pd.concat(dataframes, ignore_index=True)
+# final_df.to_csv(FULL_DATASET_CSV, index=False)
 
-print(f"\n💾 Done! Saved {len(final_df):,} total rows to {FULL_DATASET_CSV}")
+# print(f"\n💾 Done! Saved {len(final_df):,} total rows to {FULL_DATASET_CSV}")
