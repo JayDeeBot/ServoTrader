@@ -8,6 +8,12 @@ Single-decision HOLD/SELL pretraining environment with:
 - Tolerant detection of symbol column names (symbol/pair/ticker)
 - Periodic dataset chunk loading (e.g., every 10k episodes)
 - Future-return reward: HOLD = +r, SELL = -r (optional tanh bounding)
+
+Update (stringent pricing):
+- The future-return r now uses a *pessimistic* exit at the horizon:
+    r = ( Low[t+H] - Close[t] ) / Close[t]
+  This keeps rewards in **percentage return space** (normalized across assets),
+  while being stricter than Close→Close.
 """
 
 from __future__ import annotations
@@ -72,9 +78,12 @@ class SellHoldTrainingEnv(gym.Env):
         - Choose a *held* symbol i (random or round-robin).
     At step(action):
         - Legal actions: HOLD (0), SELL (N+1). Others masked.
-        - Compute look-ahead return r_i(t→t+H) on raw prices.
+        - Compute look-ahead return r_i(t→t+H) on raw prices (percentage).
         - Reward =  +r if HOLD,  -r if SELL  (optionally tanh-bounded).
         - done=True (single-step episode).
+
+    Stringent pricing (this version):
+        r_i = (Low[t+H, i] - Close[t, i]) / Close[t, i]
     """
 
     metadata = {"render.modes": ["human"]}
@@ -83,20 +92,21 @@ class SellHoldTrainingEnv(gym.Env):
         self,
         data: pd.DataFrame,
         crypto_codes: List[str],
-        episode_timeout: int = 30,
+        episode_timeout: int = 60,
         history_window: int = 5,
-        lookahead_steps: int = 30,
+        lookahead_steps: int = 1,
         held_selection: Literal["random", "round_robin"] = "random",
         reward_bounded: bool = False,
         seed: int | None = None,
         # --- Chunking knobs (match buy env) ---
-        chunk_dir: str | None = "/home/jarred/git/ServoTrader/data/split_10k_chunks_ancient",
+        chunk_dir: str | None = "/home/jarred/git/ServoTrader/data/split_10k_chunks_ancient_2",
         chunk_size: int = 10_000,
         start_chunk_index: int = 0,          # index for the *initial* `data`
         enable_chunking: bool | None = None, # None => auto True if dir exists
     ):
         super().__init__()
         self.rng = np.random.default_rng(seed)
+        self.low_to_low_one_step = True  # Set reward calculation mode
 
         # --- Config (normalize configured codes) ---
         self.crypto_codes = sorted({_norm_symbol(c) for c in crypto_codes})
@@ -155,7 +165,9 @@ class SellHoldTrainingEnv(gym.Env):
         """
         Given a dataframe with 'symbol' and 'symbol_norm':
           - Intersect with configured codes (already normalized)
-          - Build data tensor [T, N, F] and raw_close [T, N]
+          - Build data tensor [T, N, F] and raw price matrices
+              * raw_close: [T, N]
+              * raw_low  : [T, N]
           - Update env shapes / bookkeeping
         """
         # Group lookups keyed by normalized symbol
@@ -166,6 +178,7 @@ class SellHoldTrainingEnv(gym.Env):
 
         self.data = data
         self.raw_close = raw_close
+        # self.raw_low is attached inside _preprocess_data
         self.num_timesteps, self.num_cryptos, self.features_per_crypto = self.data.shape
         self.crypto_codes = used_codes  # normalized, ordered
 
@@ -183,8 +196,12 @@ class SellHoldTrainingEnv(gym.Env):
         """
         Convert stacked dataframe into:
           - data_tensor: [T, N, F] normalized features
-          - raw_close  : [T, N]     raw close prices
+          - raw_close  : [T, N]     raw close prices  (decision-time mark)
         using NORMALIZED symbols for membership/grouping.
+
+        Note:
+          We also extract and attach `self.raw_low` for stringent reward modelling:
+            r = (Low[t+H] - Close[t]) / Close[t]
         """
         if "symbol_norm" not in raw_df.columns:
             raw_df = _ensure_symbol_column(raw_df)
@@ -211,7 +228,8 @@ class SellHoldTrainingEnv(gym.Env):
         F = len(all_cols)
 
         data_tensor = np.zeros((T, N, F), dtype=np.float32)
-        raw_close = np.zeros((T, N), dtype=np.float64)
+        raw_close   = np.zeros((T, N), dtype=np.float64)
+        raw_low     = np.zeros((T, N), dtype=np.float64)  # ← store future exit baseline (stringent)
 
         window = max(2, int(self.timeout_steps))
 
@@ -223,17 +241,18 @@ class SellHoldTrainingEnv(gym.Env):
                 .copy()
             )
 
-            # Fill prices forward/back
+            # Fill prices forward/back to avoid small gaps
             for c in ["open", "high", "low", "close", "vwap"]:
                 df[c] = df[c].ffill().bfill()
 
             # Fill volume/count with zeros
             df[["volume", "count"]] = df[["volume", "count"]].fillna(0.0)
 
-            # Preserve raw close BEFORE normalization
+            # Preserve raw prices BEFORE normalization for rewards
             raw_close[:, j] = df["close"].to_numpy()
+            raw_low[:, j]   = df["low"].to_numpy()
 
-            # Engineered features
+            # Engineered features (computed on CLOSE for stability)
             df["recent_return"] = df["close"].pct_change(periods=window).fillna(0.0)
             df["volatility"] = df["close"].rolling(window).std().fillna(0.0)
 
@@ -247,7 +266,7 @@ class SellHoldTrainingEnv(gym.Env):
             df["trend_slope"] = df["close"].rolling(window).apply(slope_func, raw=False).fillna(0.0)
             df["moving_avg"] = df["close"].rolling(window).mean().bfill()
 
-            # Normalize prices with min-max
+            # Normalize prices with min-max per symbol (0..1)
             for c in ["open", "high", "low", "close", "vwap"]:
                 cmin, cmax = float(df[c].min()), float(df[c].max())
                 rng = (cmax - cmin) if cmax != cmin else 1.0
@@ -267,6 +286,9 @@ class SellHoldTrainingEnv(gym.Env):
                 df[c] = (df[c] - cmin) / rng
 
             data_tensor[:, j, :] = df[all_cols].to_numpy(dtype=np.float32)
+
+        # Attach raws for reward computation
+        self.raw_low = raw_low
 
         return data_tensor, raw_close, overlap  # overlap is normalized symbol order
 
@@ -329,9 +351,10 @@ class SellHoldTrainingEnv(gym.Env):
     def step(self, action: int):
         """
         Single decision:
-            - HOLD (0):  reward = +future_return(held)
+            - HOLD (0):   reward = +future_return(held)
             - SELL (N+1): reward = -future_return(held)
             - Episode terminates immediately.
+
         Also rolls over dataset every `chunk_size` episodes if chunking is enabled.
         """
         mask = self._get_action_mask()
@@ -348,11 +371,14 @@ class SellHoldTrainingEnv(gym.Env):
 
             return obs, float(reward), terminated, truncated, {"action_mask": mask}
 
-        # Compute reward on the held symbol
+        # Compute percentage future return on the held symbol (stringent: Low at horizon)
         r = self._future_return(self.current_step, int(self.held_index), self.lookahead_steps)
+
+        # Symmetric reward design preserves credit assignment:
         reward = r if action == 0 else -r  # HOLD vs SELL
         if self.reward_bounded:
-            reward = float(np.tanh(reward))  # optional squashing to [-1, 1]
+            # Optional squashing to [-1, 1] for stability on volatile series
+            reward = float(np.tanh(reward))
 
         # Single-step episode ends
         terminated, truncated = True, False
@@ -419,14 +445,42 @@ class SellHoldTrainingEnv(gym.Env):
 
     def _future_return(self, t: int, i: int, H: int) -> float:
         """
-        Compute raw-price future return for symbol i from t to t+H:
-            (C[t+H,i] - C[t,i]) / C[t,i]
-        Clamps t+H to the dataset end; returns 0 if denominator is zero/invalid.
+        Compute **percentage** future return for symbol i from t to t+H
+        using a *stringent* exit at the horizon:
+
+            If low_to_low_one_step: one-step % change in Low:
+            r = (Low[t+1,i] - Low[t,i]) / Low[t,i]
+            Else (default stringent horizon): (Low[t+H,i] - Close[t,i]) / Close[t,i]
+
+        Notes:
+        - We clamp t+H within dataset bounds; ensure at least 1 step of lookahead.
+        - Returns 0 if denominator is zero/invalid.
+        - This keeps reward magnitudes normalized across cryptos (percentage space),
+          but is stricter than Close→Close because it marks exit at the worst
+          price of the future bar.
+
+        Args:
+            t (int): current time index
+            i (int): held symbol index
+            H (int): lookahead horizon (in bars)
+
+        Returns:
+            float: percentage return (can be negative/positive)
         """
+        if getattr(self, "low_to_low_one_step", False):
+            t0 = t
+            t1 = min(self.num_timesteps - 1, t + 1)
+            base = float(self.raw_low[t0, i])
+            futr = float(self.raw_low[t1, i])
+            if base == 0.0 or not np.isfinite(base) or not np.isfinite(futr):
+                return 0.0
+            return (futr - base) / base
+
+        # fallback: current stringent (Low at horizon vs Close now)
         t0 = t
         t1 = min(self.num_timesteps - 1, t + max(1, H))
         base = float(self.raw_close[t0, i])
-        futr = float(self.raw_close[t1, i])
+        futr = float(self.raw_low[t1, i])
         if base == 0.0 or not np.isfinite(base) or not np.isfinite(futr):
             return 0.0
         return (futr - base) / base

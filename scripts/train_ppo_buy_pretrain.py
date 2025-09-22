@@ -4,6 +4,20 @@
 train_ppo_buy_pretrain.py
 
 PPO pretraining script for BuyTrainingEnv (single-decision, buy-only ranking env).
+
+Now supports **either**:
+- MaskablePPO (with action masking via ActionMasker), or
+- RecurrentPPO (LSTM) using a lightweight LSTMActionMaskWrapper, mirroring your other script.
+
+Key features:
+- Loads crypto codes and a CSV dataset, with robust normalization and overlap checks
+- Builds the BuyTrainingEnv with stringent pricing and optional peak-within-window rewards
+- Trains with MaskablePPO *or* RecurrentPPO (MlpLstmPolicy)
+- Saves periodic checkpoints and a final model
+- Logs to TensorBoard (see LOG_DIR)
+
+Run `tensorboard --logdir /home/jarred/git/ServoTrader/logs --port 6006` to visualize training
+To view logs go to '[http://localhost:6006](http://localhost:6006)'
 """
 
 # scripts/train_ppo_buy_pretrain.py
@@ -22,8 +36,15 @@ import pandas as pd
 
 from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor
 from stable_baselines3.common.callbacks import CheckpointCallback
-from sb3_contrib import MaskablePPO
+
+# Algorithms
+from sb3_contrib import MaskablePPO, RecurrentPPO
 from sb3_contrib.common.wrappers import ActionMasker
+
+# Optional LSTM action-mask wrapper (matches your other script pattern)
+# This wrapper should consult env._get_action_mask() and filter logits/action sampling.
+# If your project already has this, import it; otherwise, comment out and use MaskablePPO.
+from wrappers.action_mask_wrapper import LSTMActionMaskWrapper
 
 # 👇 Import your BuyTrainingEnv
 from servo_trader.envs.buy_training_env import BuyTrainingEnv
@@ -32,43 +53,76 @@ from servo_trader.envs.buy_training_env import BuyTrainingEnv
 # --------------------------
 # Configurable paths/flags
 # --------------------------
-CODES_PATH = "/home/jarred/git/ServoTrader/servo_trader/config/crypto_codes_ancient.json"
-DATA_PATH  = "/home/jarred/git/ServoTrader/data/split_10k_chunks_ancient/000.csv"
+CODES_PATH = "/home/jarred/git/ServoTrader/servo_trader/config/crypto_codes_ancient_2.json"
+DATA_PATH  = "/home/jarred/git/ServoTrader/data/split_10k_chunks_ancient_2/000.csv"
 
 MODEL_DIR  = "/home/jarred/git/ServoTrader/models"
 LOG_DIR    = "/home/jarred/git/ServoTrader/logs"
-MODEL_NAME = "ppo_buy_pretrain_bulbasaur"
+MODEL_NAME = "ppo_vegeta"  # name prefix for checkpoints and final model
 
+# Training run knobs
 TOTAL_TIMESTEPS   = 1_000_000
 CHECKPOINT_EVERY  = 100_000
 CONTINUE_TRAINING = False
 
+# Algorithm switch
+USE_LSTM = True   # ← Set True to use RecurrentPPO (MlpLstmPolicy). False = MaskablePPO (MlpPolicy).
+
 # BuyTrainingEnv knobs
-HISTORY_WINDOW   = 5
-LOOKAHEAD_STEPS  = 30
+HISTORY_WINDOW   = 1
+LOOKAHEAD_STEPS  = 60
 REWARD_MODE      = "zero_to_one"
-EPISODE_TIMEOUT  = 30
+EPISODE_TIMEOUT  = 60
+USE_PEAK_IN_WINDOW = True  # Use peak-within-window reward from BuyTrainingEnv
 
 
 # --------------------------
 # Helpers (robust + normalized)
 # --------------------------
 def _norm_symbol(s: str) -> str:
-    """Normalize to canonical BASEQUOTE (uppercase, strip / - _)."""
+    """
+    Normalize a symbol string to canonical BASEQUOTE (uppercase, strip / - _).
+
+    Args:
+        s (str): Input symbol (e.g., 'btc/usdt', 'ETH-USD').
+
+    Returns:
+        str: Normalized symbol (e.g., 'BTCUSDT', 'ETHUSD').
+    """
     s = (s or "").strip().upper()
     return re.sub(r"[\/\-_]", "", s)
 
+
 def _looks_like_symbol(s: str) -> bool:
-    """Heuristic to avoid mistaking config keys for symbols."""
+    """
+    Heuristic: determine if a string looks like an exchange symbol (A-Z0-9, len 5..15).
+
+    Args:
+        s (str): Candidate string.
+
+    Returns:
+        bool: True if it looks like a symbol.
+    """
     return bool(re.fullmatch(r"[A-Z0-9]{5,15}", s or ""))
+
 
 def load_crypto_codes(path: str) -> list[str]:
     """
-    Robustly load codes from JSON supporting shapes like:
+    Robustly load symbols from a JSON file.
+    Supports:
       - ["BTCUSDT", "ETHUSDT", ...]
       - {"codes": [...]}, {"crypto_codes": [...]}, {"symbols": [...]}, {"tickers": [...]}
-      - { "BTCUSDT": {...}, "ETHUSDT": {...} }  (dict-of-meta; uses KEYS as last resort)
-      - { "CRYPTOCODES": ["BTCUSDT", ...] }     (values win)
+      - { "BTCUSDT": {...}, "ETHUSDT": {...} } (dict-of-meta; uses KEYS as last resort)
+      - { "CRYPTOCODES": ["BTCUSDT", ...] }   (values win)
+
+    Args:
+        path (str): JSON file path.
+
+    Returns:
+        list[str]: Sorted, deduplicated, normalized symbols.
+
+    Raises:
+        ValueError: If no valid list can be found/parsed.
     """
     with open(path, "r") as f:
         blob = json.load(f)
@@ -83,13 +137,13 @@ def load_crypto_codes(path: str) -> list[str]:
             if isinstance(v, list) and all(isinstance(x, str) for x in v):
                 codes = v
                 break
-        # 2) Any dict value that is a list[str]
+        # 2) Any dict value that is list[str]
         if codes is None:
             for v in blob.values():
                 if isinstance(v, list) and all(isinstance(x, str) for x in v):
                     codes = v
                     break
-        # 3) Dict-of-meta: use KEYS if they look like symbols (last resort)
+        # 3) Dict-of-meta: use KEYS if they look like symbols
         if codes is None:
             keys = [k for k in blob.keys() if isinstance(k, str)]
             if keys and all(_looks_like_symbol(_norm_symbol(k)) for k in keys):
@@ -107,8 +161,20 @@ def load_crypto_codes(path: str) -> list[str]:
         raise ValueError(f"Parsed codes from {path}, but they’re empty after normalization.")
     return codes
 
+
 def find_symbol_column(df: pd.DataFrame) -> str:
-    """Find a symbol-like column, tolerant of casing & aliases."""
+    """
+    Find the symbol-like column in a CSV (tolerant of casing & aliases).
+
+    Args:
+        df (pd.DataFrame): DataFrame loaded from CSV.
+
+    Returns:
+        str: The original column name in the DF that holds the symbol/pair/ticker.
+
+    Raises:
+        ValueError: If no plausible column is found.
+    """
     cols_lower = {c.lower(): c for c in df.columns}
     for cand in ("symbol", "pair", "ticker"):
         if cand in cols_lower:
@@ -117,11 +183,21 @@ def find_symbol_column(df: pd.DataFrame) -> str:
 
 
 # --------------------------
-# Env factory
+# Environment builders
 # --------------------------
-def make_env(crypto_codes, historical_df):
+def make_env(crypto_codes: list[str], historical_df: pd.DataFrame, *, use_peak: bool) -> callable:
     """
-    Factory for a single BuyTrainingEnv instance wrapped with an action masker.
+    Factory that returns a thunk creating a single BuyTrainingEnv instance.
+    For MaskablePPO, we will wrap with ActionMasker later.
+    For LSTM (RecurrentPPO), we will instead wrap the vec env with LSTMActionMaskWrapper after creation.
+
+    Args:
+        crypto_codes (list[str]): Normalized list of symbols to train on.
+        historical_df (pd.DataFrame): CSV data as DataFrame.
+        use_peak (bool): Whether to enable the peak-within-window reward in the env.
+
+    Returns:
+        callable: A no-arg function that builds and returns the environment instance.
     """
     def _env_fn():
         env = BuyTrainingEnv(
@@ -131,29 +207,151 @@ def make_env(crypto_codes, historical_df):
             history_window=HISTORY_WINDOW,
             lookahead_steps=LOOKAHEAD_STEPS,
             reward_mode=REWARD_MODE,
+            use_peak_within_window=use_peak,
             # You can pass chunking knobs here if desired (uses env defaults otherwise)
-            # chunk_dir="/home/jarred/git/ServoTrader/data/split_10k_chunks_ancient",
+            chunk_dir="/home/jarred/git/ServoTrader/data/split_10k_chunks_ancient_2",
             # chunk_size=10_000,
             # start_chunk_index=0,
             # enable_chunking=None,
         )
+        return env
+    return _env_fn
 
-        # Mask all actions except BUY 1..N at every step
+
+def build_vec_env(crypto_codes: list[str], historical_df: pd.DataFrame, *, use_lstm: bool, use_peak: bool):
+    """
+    Build and wrap the vectorized environment according to the algorithm selection.
+
+    - For MaskablePPO: wraps with ActionMasker to supply a legal action mask (BUY 1..N only).
+    - For RecurrentPPO: wraps with LSTMActionMaskWrapper (your project wrapper) after VecMonitor.
+
+    Args:
+        crypto_codes (list[str]): Training symbols.
+        historical_df (pd.DataFrame): CSV data.
+        use_lstm (bool): Whether to build the env stack for LSTM training.
+        use_peak (bool): Enable peak-within-window reward.
+
+    Returns:
+        DummyVecEnv: A VecEnv with proper wrappers applied.
+    """
+    if not use_lstm:
+        # Maskable path (MaskablePPO expects a mask via ActionMasker)
         def mask_fn(e):
+            """Return boolean mask for legal actions (only BUY 1..N are legal)."""
             if hasattr(e, "_get_action_mask"):
                 return e._get_action_mask()
             mask = np.zeros(e.action_space.n, dtype=bool)
             mask[1:1 + e.num_cryptos] = True
             return mask
 
-        return ActionMasker(env, mask_fn)
-    return _env_fn
+        env = DummyVecEnv([lambda: ActionMasker(make_env(crypto_codes, historical_df, use_peak=use_peak)(), mask_fn)])
+        env = VecMonitor(env)
+        return env
+
+    # LSTM path (RecurrentPPO). We build the raw env and inject LSTMActionMaskWrapper after VecMonitor.
+    env = DummyVecEnv([make_env(crypto_codes, historical_df, use_peak=use_peak)])
+    env = VecMonitor(env)
+    # Replace the single underlying env with the LSTM action-mask wrapper.
+    # The wrapper will receive the model later (after we construct it).
+    env.envs[0] = LSTMActionMaskWrapper(env.envs[0], model=None)
+    return env
+
+
+# --------------------------
+# Algorithm / Model builders
+# --------------------------
+def ppo_hyperparams(use_lstm: bool) -> dict:
+    """
+    Default PPO hyperparameters tuned for single-step episodes.
+
+    Args:
+        use_lstm (bool): If True, returns defaults suitable for RecurrentPPO (MlpLstmPolicy).
+
+    Returns:
+        dict: Keyword arguments for the PPO/RecurrentPPO constructors.
+    """
+    # Shared baseline settings; you can adjust per your experiments.
+    base = dict(
+        learning_rate=5e-5,
+        n_steps=512 if use_lstm else 256,  # can bump for stability; single-step eps are fine
+        batch_size=64,
+        gamma=0.97,
+        gae_lambda=0.95,
+        clip_range=0.2,
+        ent_coef=0.02 if not use_lstm else 0.01,  # a touch lower for LSTM if desired
+        vf_coef=0.5,
+        max_grad_norm=0.5,
+        normalize_advantage=True,
+        device="cpu",
+        verbose=1,
+        tensorboard_log=LOG_DIR,
+    )
+
+    # Example LSTM policy kwargs (optional; uncomment to tune LSTM size/layers)
+    # if use_lstm:
+    #     base["policy_kwargs"] = dict(
+    #         lstm_hidden_size=256,
+    #         n_lstm_layers=1,
+    #         shared_lstm=False,
+    #     )
+
+    return base
+
+
+def build_model(env, *, use_lstm: bool, continue_training: bool):
+    """
+    Create or load the PPO model based on the selected algorithm.
+
+    Args:
+        env (VecEnv): Vectorized environment already wrapped.
+        use_lstm (bool): If True, uses RecurrentPPO("MlpLstmPolicy"); else MaskablePPO("MlpPolicy").
+        continue_training (bool): If True, loads existing model weights from MODEL_DIR/MODEL_NAME.zip.
+
+    Returns:
+        (BaseAlgorithm, str): The model instance and the resolved model path prefix for saves/checkpoints.
+    """
+    cfg = ppo_hyperparams(use_lstm)
+    model_path = os.path.join(MODEL_DIR, MODEL_NAME)
+
+    if continue_training and os.path.exists(model_path + ".zip"):
+        print(f"[BuyPretrain] Resuming from {model_path}.zip")
+        model_cls = RecurrentPPO if use_lstm else MaskablePPO
+        model = model_cls.load(
+            model_path,
+            env=env,
+            tensorboard_log=cfg["tensorboard_log"],
+            device=cfg["device"],
+        )
+        # Inject the model into the LSTM wrapper after load (if needed)
+        if use_lstm and hasattr(env, "envs") and len(env.envs) == 1 and isinstance(env.envs[0], LSTMActionMaskWrapper):
+            env.envs[0].model = model
+        return model, model_path
+
+    print("[BuyPretrain] Creating new model…")
+    if use_lstm:
+        model = RecurrentPPO("MlpLstmPolicy", env, **cfg)
+        # Inject the model into the LSTM wrapper so it can mask logits/actions
+        if hasattr(env, "envs") and len(env.envs) == 1 and isinstance(env.envs[0], LSTMActionMaskWrapper):
+            env.envs[0].model = model
+    else:
+        model = MaskablePPO("MlpPolicy", env, **cfg)
+
+    return model, model_path
 
 
 # --------------------------
 # Main
 # --------------------------
 def main():
+    """
+    Entrypoint:
+      - Loads codes & CSV
+      - Validates overlap
+      - Builds env (with Maskable or LSTM support)
+      - Builds/loads model
+      - Trains with checkpointing
+      - Saves final model
+    """
     os.makedirs(MODEL_DIR, exist_ok=True)
     os.makedirs(LOG_DIR, exist_ok=True)
 
@@ -181,38 +379,10 @@ def main():
     crypto_codes = overlap
 
     print("[BuyPretrain] Building environment…")
-    env = DummyVecEnv([make_env(crypto_codes, historical_df)])
-    env = VecMonitor(env)
+    env = build_vec_env(crypto_codes, historical_df, use_lstm=USE_LSTM, use_peak=USE_PEAK_IN_WINDOW)
 
-    # PPO hyperparameters tuned for single-step episodes
-    ppo_config = dict(
-        learning_rate=5e-5,
-        n_steps=256,                 # rollout length; fine even though episodes are single-step
-        batch_size=64,
-        gamma=0.97,                  # minor effect with single-step episodes
-        gae_lambda=0.95,
-        clip_range=0.2,
-        ent_coef=0.02,               # encourage exploration across many BUYs
-        vf_coef=0.5,
-        max_grad_norm=0.5,
-        normalize_advantage=True,
-        device="cpu",
-        verbose=1,
-        tensorboard_log=LOG_DIR,
-    )
-
-    if CONTINUE_TRAINING:
-        model_path = os.path.join(MODEL_DIR, MODEL_NAME)
-        print(f"[BuyPretrain] Resuming from {model_path}.zip")
-        model = MaskablePPO.load(
-            model_path,
-            env=env,
-            tensorboard_log=LOG_DIR,
-            device=ppo_config["device"],
-        )
-    else:
-        print("[BuyPretrain] Creating new model…")
-        model = MaskablePPO("MlpPolicy", env, **ppo_config)
+    # Build or load model
+    model, model_path = build_model(env, use_lstm=USE_LSTM, continue_training=CONTINUE_TRAINING)
 
     # Checkpointing
     checkpoint_cb = CheckpointCallback(
@@ -228,9 +398,8 @@ def main():
     print(f"[BuyPretrain] Training complete in {elapsed/60:.1f} minutes.")
 
     # Save final model
-    final_path = os.path.join(MODEL_DIR, MODEL_NAME)
-    model.save(final_path)
-    print(f"[BuyPretrain] Saved final model to: {final_path}.zip")
+    model.save(model_path)
+    print(f"[BuyPretrain] Saved final model to: {model_path}.zip")
     print(f"[TensorBoard] Logs: {LOG_DIR}")
 
 

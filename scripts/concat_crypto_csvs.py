@@ -5,8 +5,8 @@ from multiprocessing import Pool
 import time
 
 # Config
-FOLDER_PATH = "/home/jarred/git/ServoTrader/data/individual_crypto_csvs"
-OUTPUT_FILE = "/home/jarred/git/ServoTrader/data/ancient_historical_crypto_data.csv"
+FOLDER_PATH = "/home/jarred/git/ServoTrader/data/individual_crypto_csvs_ancient_2"
+OUTPUT_FILE = "/home/jarred/git/ServoTrader/data/ancient_historical_crypto_data_2.csv"
 NUM_WORKERS = 8
 
 def read_csv_stream(file_path):

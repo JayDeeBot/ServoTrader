@@ -19,6 +19,7 @@ from gymnasium import spaces
 import numpy as np
 import pandas as pd
 from scipy.stats import linregress
+from collections import deque  # ← NEW: for forward max precompute
 
 
 # -----------------------------
@@ -82,10 +83,12 @@ class BuyTrainingEnv(gym.Env):
         self,
         data: pd.DataFrame,
         crypto_codes: list[str],
-        episode_timeout: int = 30,
+        episode_timeout: int = 60,
         history_window: int = 5,
-        lookahead_steps: int = 30,
+        lookahead_steps: int = 60,
         reward_mode: str = "zero_to_one",
+        # --- NEW: reward behavior toggles ---
+        use_peak_within_window: bool = False,   # if True, exit uses best pessimistic Low within [t+1..t+H]
         # --- Chunking knobs ---
         chunk_dir: str | None = "/home/jarred/git/ServoTrader/data/split_10k_chunks_ancient",
         chunk_size: int = 10_000,
@@ -100,6 +103,7 @@ class BuyTrainingEnv(gym.Env):
         self.history_window = int(history_window)
         self.lookahead_steps = int(lookahead_steps)
         self.reward_mode = reward_mode
+        self.use_peak_within_window = bool(use_peak_within_window)
 
         # --- Chunking config/state ---
         self.chunk_dir = chunk_dir
@@ -160,12 +164,17 @@ class BuyTrainingEnv(gym.Env):
         self.num_timesteps, self.num_cryptos, self.features_per_crypto = self.data.shape
         self.crypto_codes = used_codes  # normalized, ordered
 
+        # --- NEW: precompute forward max(low) for peak-in-window mode ---
+        self._precompute_forward_max_low(self.lookahead_steps)
+
         if first_time:
             # On first build, keep pointer where it is (set in __init__)
             pass
         else:
             # On chunk reload, reset local pointer to a safe start
             self.pointer = max(0, self.history_window - 1)
+            # need at least one future step
+            self.pointer = min(self.pointer, self.num_timesteps - 2)
             self.current_step = self.pointer
 
     # -------------------
@@ -204,6 +213,9 @@ class BuyTrainingEnv(gym.Env):
 
         data_tensor = np.zeros((T, N, F), dtype=np.float32)
         raw_close = np.zeros((T, N), dtype=np.float64)
+        # --- NEW: raw high/low for stringent pricing ---
+        raw_high = np.zeros((T, N), dtype=np.float64)
+        raw_low  = np.zeros((T, N), dtype=np.float64)
 
         window = max(2, int(self.timeout_steps))
 
@@ -221,8 +233,10 @@ class BuyTrainingEnv(gym.Env):
             # Volume/count zeros for missing
             df[["volume", "count"]] = df[["volume", "count"]].fillna(0.0)
 
-            # Preserve raw close BEFORE normalization
+            # Preserve raw close/high/low BEFORE normalization
             raw_close[:, j] = df["close"].to_numpy()
+            raw_high[:, j]  = df["high"].to_numpy()
+            raw_low[:, j]   = df["low"].to_numpy()
 
             # Engineered features
             df["recent_return"] = df["close"].pct_change(periods=window).fillna(0.0)
@@ -259,6 +273,10 @@ class BuyTrainingEnv(gym.Env):
 
             data_tensor[:, j, :] = df[all_features].to_numpy(dtype=np.float32)
 
+        # Attach raws for later use (stringent pricing & peak)
+        self.raw_high = raw_high
+        self.raw_low = raw_low
+
         return data_tensor, raw_close, overlap  # overlap is the normalized symbol order
 
     # -------------------
@@ -287,6 +305,59 @@ class BuyTrainingEnv(gym.Env):
 
         print(f"✅ Chunk {self.loaded_chunk_index:03}.csv loaded and preprocessed")
 
+    # -------------------
+    # Forward max cache (for peak-in-window)
+    # -------------------
+    def _precompute_forward_max_low(self, H: int) -> None:
+        """
+        Precompute forward window MAX of low prices for each t (exclude t itself):
+        fwd_max_low[t, i] = max( raw_low[t+1 : t+H, i] ), clamped within bounds.
+        Shape: [T, N]. Near tail, the window shrinks naturally.
+        """
+        T, N = getattr(self, "num_timesteps", 0), getattr(self, "num_cryptos", 0)
+        if T == 0 or N == 0:
+            self._fwd_max_low = None
+            return
+
+        H = max(1, int(H))
+        fml = np.zeros((T, N), dtype=np.float64)
+        low = self.raw_low  # [T, N]
+
+        # For each column, compute sliding forward max over (t+1 .. t+H)
+        # using a monotonic deque in O(T) time per column.
+        last_idx = T - 1
+        for j in range(N):
+            arr = low[:, j]
+            dq: deque[int] = deque()
+
+            # Initialize deque with indices 1..min(H, last_idx)
+            upper = min(H, last_idx)
+            for idx in range(1, upper + 1):
+                while dq and arr[dq[-1]] <= arr[idx]:
+                    dq.pop()
+                dq.append(idx)
+
+            for t in range(T):
+                # Maintain window [t+1, min(t+H, last_idx)]
+                left_bound = t + 1
+                while dq and dq[0] < left_bound:
+                    dq.popleft()
+
+                # Read max (if window empty, fallback to arr[min(t+1, last_idx)])
+                if dq:
+                    fml[t, j] = arr[dq[0]]
+                else:
+                    fml[t, j] = arr[left_bound if left_bound <= last_idx else last_idx]
+
+                # Advance window: include new index for next t
+                new_idx = t + H + 1
+                if new_idx <= last_idx:
+                    while dq and arr[dq[-1]] <= arr[new_idx]:
+                        dq.pop()
+                    dq.append(new_idx)
+
+        self._fwd_max_low = fml  # [T, N]
+
     # -------------
     # Gym methods
     # -------------
@@ -306,7 +377,10 @@ class BuyTrainingEnv(gym.Env):
         self._episode_started_at = self.current_step
 
         obs = self._get_observation()
-        info = {"action_mask": self._get_action_mask()}
+        info = {
+            "action_mask": self._get_action_mask(),
+            "peak_mode": self.use_peak_within_window,
+        }
         return obs, info
 
     def step(self, action: int):
@@ -325,18 +399,22 @@ class BuyTrainingEnv(gym.Env):
             if self.enable_chunking and self.chunk_size > 0 and (self.global_step % self.chunk_size == 0):
                 self._load_next_chunk()
 
-            return obs, float(reward), terminated, truncated, {"action_mask": legal}
+            return obs, float(reward), terminated, truncated, {"action_mask": legal, "peak_mode": self.use_peak_within_window}
 
         # Map action (1..N) -> symbol index [0..N-1]
         chosen_idx = action - 1
 
-        # Rank reward from future returns
+        # Rank reward from future returns (stringent pricing; peak mode optional)
         future_returns = self._compute_future_returns(self.current_step, self.lookahead_steps)
         reward = self._rank_to_reward(future_returns, chosen_idx, mode=self.reward_mode)
 
         terminated, truncated = True, False
         obs = self._get_observation()
-        info = {"action_mask": self._get_action_mask()}
+        info = {
+            "action_mask": self._get_action_mask(),
+            "horizon_used": getattr(self, "_last_horizon_used", self.lookahead_steps),
+            "peak_mode": self.use_peak_within_window,
+        }
 
         # Episode complete; increment global step and possibly roll chunk
         self.global_step += 1
@@ -385,18 +463,40 @@ class BuyTrainingEnv(gym.Env):
     # -------------------
     def _compute_future_returns(self, t: int, H: int) -> np.ndarray:
         """
-        Per-symbol future return from t to t+H using RAW closes:
-            r_i = (Close[t+H, i] - Close[t, i]) / Close[t, i]
+        Per-symbol future return using STRINGENT pricing:
+          - Entry at time t uses RAW HIGH (worst-case buy fill).
+          - Exit uses RAW LOW with either:
+              * end-of-window: Low[t+H]
+              * peak-in-window: max Low over (t+1 .. t+H] if use_peak_within_window=True
+        Returns:
+            r_i = (Exit_i - Entry_i) / Entry_i
         """
-        t0 = t
-        t1 = min(self.num_timesteps - 1, t + max(1, H))
-        base = self.raw_close[t0, :]
-        future = self.raw_close[t1, :]
+        t0 = int(t)
+        # Effective horizon if near the tail (at least 1 step forward)
+        H_eff = max(1, min(int(H), (self.num_timesteps - 1) - t0))
+        t1 = t0 + H_eff
 
-        denom = np.where(base != 0.0, base, np.nan)
-        ret = (future - base) / denom
-        ret = np.nan_to_num(ret, nan=0.0, posinf=0.0, neginf=0.0)
-        return ret.astype(np.float32)
+        # Entry = pessimistic buy fill at current bar
+        entry = self.raw_high[t0, :]  # [N]
+
+        if self.use_peak_within_window:
+            # Best pessimistic exit within the window: forward MAX of Low(t+1..t+H)
+            if getattr(self, "_fwd_max_low", None) is not None:
+                future_pess = self._fwd_max_low[t0, :]  # [N], already excludes t itself
+            else:
+                # Fallback: use end-of-window Low if cache unavailable
+                future_pess = self.raw_low[t1, :]
+        else:
+            # End-of-window pessimistic exit
+            future_pess = self.raw_low[t1, :]
+
+        denom = np.where(entry != 0.0, entry, np.nan)
+        ret = (future_pess - entry) / denom
+        ret = np.nan_to_num(ret, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+
+        # for logging
+        self._last_horizon_used = H_eff
+        return ret
 
     def _rank_to_reward(self, returns: np.ndarray, chosen_idx: int, mode: str = "zero_to_one") -> float:
         """
