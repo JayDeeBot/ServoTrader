@@ -92,20 +92,21 @@ class SellHoldTrainingEnv(gym.Env):
         self,
         data: pd.DataFrame,
         crypto_codes: List[str],
-        episode_timeout: int = 30,
+        episode_timeout: int = 60,
         history_window: int = 5,
-        lookahead_steps: int = 30,
+        lookahead_steps: int = 1,
         held_selection: Literal["random", "round_robin"] = "random",
         reward_bounded: bool = False,
         seed: int | None = None,
         # --- Chunking knobs (match buy env) ---
-        chunk_dir: str | None = "/home/jarred/git/ServoTrader/data/split_10k_chunks_ancient",
+        chunk_dir: str | None = "/home/jarred/git/ServoTrader/data/split_10k_chunks_ancient_2",
         chunk_size: int = 10_000,
         start_chunk_index: int = 0,          # index for the *initial* `data`
         enable_chunking: bool | None = None, # None => auto True if dir exists
     ):
         super().__init__()
         self.rng = np.random.default_rng(seed)
+        self.low_to_low_one_step = True  # Set reward calculation mode
 
         # --- Config (normalize configured codes) ---
         self.crypto_codes = sorted({_norm_symbol(c) for c in crypto_codes})
@@ -447,7 +448,9 @@ class SellHoldTrainingEnv(gym.Env):
         Compute **percentage** future return for symbol i from t to t+H
         using a *stringent* exit at the horizon:
 
-            r = ( Low[t+H, i] - Close[t, i] ) / Close[t, i]
+            If low_to_low_one_step: one-step % change in Low:
+            r = (Low[t+1,i] - Low[t,i]) / Low[t,i]
+            Else (default stringent horizon): (Low[t+H,i] - Close[t,i]) / Close[t,i]
 
         Notes:
         - We clamp t+H within dataset bounds; ensure at least 1 step of lookahead.
@@ -464,10 +467,20 @@ class SellHoldTrainingEnv(gym.Env):
         Returns:
             float: percentage return (can be negative/positive)
         """
+        if getattr(self, "low_to_low_one_step", False):
+            t0 = t
+            t1 = min(self.num_timesteps - 1, t + 1)
+            base = float(self.raw_low[t0, i])
+            futr = float(self.raw_low[t1, i])
+            if base == 0.0 or not np.isfinite(base) or not np.isfinite(futr):
+                return 0.0
+            return (futr - base) / base
+
+        # fallback: current stringent (Low at horizon vs Close now)
         t0 = t
         t1 = min(self.num_timesteps - 1, t + max(1, H))
-        base = float(self.raw_close[t0, i])  # decision-time mark
-        futr = float(self.raw_low[t1, i])    # stringent exit at horizon
+        base = float(self.raw_close[t0, i])
+        futr = float(self.raw_low[t1, i])
         if base == 0.0 or not np.isfinite(base) or not np.isfinite(futr):
             return 0.0
         return (futr - base) / base

@@ -62,20 +62,20 @@ DATA_PATH  = "/home/jarred/git/ServoTrader/data/split_10k_chunks_ancient_2/000.c
 
 MODEL_DIR  = "/home/jarred/git/ServoTrader/models"
 LOG_DIR    = "/home/jarred/git/ServoTrader/logs"
-MODEL_NAME = "ppo_goku"                 # name prefix for checkpoints/final model
+MODEL_NAME = "ppo_gohan"                 # name prefix for checkpoints/final model
 
 TOTAL_TIMESTEPS   = 1_000_000           # adjust as needed
 CHECKPOINT_EVERY  = 100_000             # steps per checkpoint
-CONTINUE_TRAINING = True                # resume from MODEL_DIR/MODEL_NAME.zip if present
+CONTINUE_TRAINING = False                # resume from MODEL_DIR/MODEL_NAME.zip if present
 
 # Algorithm switch: True = LSTM (RecurrentPPO), False = MaskablePPO
 USE_LSTM = False
 
 # SellHoldTrainingEnv knobs
-HISTORY_WINDOW   = 1
-LOOKAHEAD_STEPS  = 45                   # future-return horizon for reward
+HISTORY_WINDOW   = 5
+LOOKAHEAD_STEPS  = 1                    # future-return horizon for reward
 HELD_SELECTION   = "round_robin"        # "random" or "round_robin"
-REWARD_BOUNDED   = False                # if True, tanh-squash reward to [-1, 1]
+REWARD_BOUNDED   = True                # if True, tanh-squash reward to [-1, 1]
 EPISODE_TIMEOUT  = 60                   # shape parity only; not used to truncate
 
 
@@ -273,19 +273,19 @@ def ppo_hyperparams(use_lstm: bool) -> dict:
         dict: Keyword arguments for the PPO/RecurrentPPO constructors.
     """
     base = dict(
-        learning_rate=5e-5,
-        n_steps=512 if use_lstm else 256,  # larger rollout can stabilize LSTM
-        batch_size=64,
-        gamma=0.97,
-        gae_lambda=0.95,
-        clip_range=0.2,
-        ent_coef=0.01 if use_lstm else 0.02,  # slightly lower entropy for LSTM by default
-        vf_coef=0.5,
-        max_grad_norm=0.5,
-        normalize_advantage=True,
-        device="cpu",
-        verbose=1,
-        tensorboard_log=LOG_DIR,
+        learning_rate = 1e-4 if not use_lstm else 5e-5,
+        n_steps       = 2048 if not use_lstm else 512,  # larger rollout for MLP
+        batch_size    = 256,
+        gamma         = 0.97,
+        gae_lambda    = 0.95,
+        clip_range    = 0.2,
+        ent_coef      = 0.002 if not use_lstm else 0.005,
+        vf_coef       = 1.0,
+        max_grad_norm = 0.5,
+        normalize_advantage = True,
+        device        = "cpu",
+        verbose       = 1,
+        tensorboard_log = LOG_DIR,
     )
 
     # Optional LSTM policy kwargs (uncomment to tune)

@@ -46,6 +46,9 @@ def slope_func(x):
         float: The slope of the best-fit line through the data points.
             Positive slope = upward trend, negative slope = downward trend.
     """
+    x = np.asarray(x, dtype=np.float64)
+    if np.any(np.isnan(x)) or np.all(x == x[0]):  # constant or NaN
+        return 0.0
     return linregress(np.arange(len(x)), x).slope
 
 import gymnasium as gym
@@ -56,6 +59,9 @@ import os
 from datetime import datetime
 import json
 from scipy.stats import linregress
+
+# Price feature indices in self.data[..., feature]
+OPEN_IDX, HIGH_IDX, LOW_IDX, CLOSE_IDX, VWAP_IDX = 0, 1, 2, 3, 4
 
 class CryptoTradingEnv(gym.Env):
     """
@@ -115,9 +121,14 @@ class CryptoTradingEnv(gym.Env):
         # Current profit: Normalized percentage profit (0 if not holding)
         # Held crypto: Index of held crypto, or a special value if none held
         obs_len = self.history_window * self.num_cryptos * self.features_per_crypto + 2 + self.num_cryptos + 1 # Calculate the length of the observation
-        low = np.zeros(obs_len, dtype=np.float32) # Set the lower bound
-        low[-(self.num_cryptos + 1 + 1)] = -1.0  # profit can be negative
-        high = np.ones(obs_len, dtype=np.float32) # Set the upper bound
+        low  = np.zeros(obs_len, dtype=np.float32) # Set the lower bound
+        high = np.ones(obs_len,  dtype=np.float32) # Set the upper bound
+        # Indices:
+        ONE_HOT_LEN = self.num_cryptos + 1
+        PROFIT_IDX  = obs_len - ONE_HOT_LEN - 1  # profit sits just before the one-hot block
+        # Allow profit to be negative/positive (e.g., -10..+10 for +/-1000%)
+        low[PROFIT_IDX]  = -10.0
+        high[PROFIT_IDX] =  10.0
         self.observation_space = spaces.Box(low=low, high=high, dtype=np.float32)
 
         # Internal Logging
@@ -155,77 +166,93 @@ class CryptoTradingEnv(gym.Env):
             tensor (Float32): 3D Tensor containing all data with shape [Timesteps, Cryptos, Features] and type np Float32
         """
         print("Preprocessing data...")
-        self.crypto_codes = sorted(raw_df['symbol'].unique()) # Sort the crypto codes in acsending order to ensure consistent ordering
-        self.num_cryptos = len(self.crypto_codes) # Save the total number of codes
-        self.num_timesteps = raw_df.groupby('symbol').size().min() # Ensures all cryptos have equal timesteps — truncates to the shortest to maintain uniform shape
+        self.crypto_codes = sorted(raw_df['symbol'].unique())  # Ensure stable ordering
+        self.num_cryptos = len(self.crypto_codes)
+        self.num_timesteps = raw_df.groupby('symbol').size().min()  # truncate to shortest
 
-        feature_cols = ['open', 'high', 'low', 'close', 'vwap', 'volume', 'count'] # Columns to extracts
-        added_features = ['recent_return', 'volatility', 'price_position', 'volume_surge', 'trend_slope', 'moving_avg'] # Additional features to compute
-        all_features = feature_cols + added_features # Total features (13)
-        self.features_per_crypto = len(all_features) # We have 13 features - Open, High, Low, Close, VWap, Volume & Count (base) + recent return, volatility, price position, volume surge, trend slope, moving avg
-        tensor = np.zeros((self.num_timesteps, self.num_cryptos, self.features_per_crypto), dtype=np.float32) # Preallocate tensor: [timesteps, cryptos, features]
+        feature_cols = ['open', 'high', 'low', 'close', 'vwap', 'volume', 'count']
+        added_features = ['recent_return', 'volatility', 'price_position', 'volume_surge', 'trend_slope', 'moving_avg']
+        all_features = feature_cols + added_features
+        self.features_per_crypto = len(all_features)
 
-        for i, symbol in enumerate(self.crypto_codes): # Loop through each crypto symbol
-            df_symbol = raw_df[raw_df['symbol'] == symbol].head(self.num_timesteps) # Select the first N rows for this symbol
-            df_symbol = df_symbol[feature_cols].astype(float) # Convert features to float
-            
-            # Fill prices with forward-fill then back-fill
-            df_symbol[['open', 'high', 'low', 'close', 'vwap']] = df_symbol[['open', 'high', 'low', 'close', 'vwap']].ffill()
-            df_symbol[['open', 'high', 'low', 'close', 'vwap']] = df_symbol[['open', 'high', 'low', 'close', 'vwap']].bfill()
+        tensor = np.zeros((self.num_timesteps, self.num_cryptos, self.features_per_crypto), dtype=np.float32)
 
-            # Fill volume and count with 0
+        # Rolling params — using explicit min_periods to avoid partial-NaN windows
+        window = int(self.feature_window)
+        rp = dict(window=window, min_periods=window)
+
+        for i, symbol in enumerate(self.crypto_codes):
+            # --- Slice & coerce numeric ---
+            df_symbol = raw_df[raw_df['symbol'] == symbol].head(self.num_timesteps)
+            df_symbol = df_symbol[feature_cols].apply(pd.to_numeric, errors='coerce')
+
+            # --- Sanitize infinities → NaN, then fill ---
+            df_symbol = df_symbol.replace([np.inf, -np.inf], np.nan)
+
+            # Fill prices with forward then backward fill (keeps level continuity)
+            price_cols = ['open', 'high', 'low', 'close', 'vwap']
+            df_symbol[price_cols] = df_symbol[price_cols].ffill().bfill()
+
+            # Fill volume/count missing with 0 (natural baseline)
             df_symbol[['volume', 'count']] = df_symbol[['volume', 'count']].fillna(0)
 
-            # --- Add engineered historical features ---
-            window = self.feature_window
+            # If an entire series was NaN (edge cases), ensure no NaNs remain
+            df_symbol[price_cols] = df_symbol[price_cols].fillna(0.0)
 
-            # 1. Recent return (as percent change over window)
-            df_symbol['recent_return'] = df_symbol['close'].pct_change(periods=window).fillna(0)
+            # --- Engineered features (robust) ---
 
-            # 2. Historical volatility (std dev over window)
-            df_symbol['volatility'] = df_symbol['close'].rolling(window).std().fillna(0)
+            # 1) Recent return over window; guard inf from 0 denominators
+            rr = df_symbol['close'].pct_change(periods=window)
+            df_symbol['recent_return'] = rr.replace([np.inf, -np.inf], 0).fillna(0)
 
-            # 3. Price position in recent range
-            high = df_symbol['high'].rolling(window).max()
-            low = df_symbol['low'].rolling(window).min()
-            df_symbol['price_position'] = ((df_symbol['close'] - low) / (high - low + 1e-6)).fillna(0)
+            # 2) Historical volatility (std dev) with full valid windows only
+            df_symbol['volatility'] = df_symbol['close'].rolling(**rp).std().fillna(0)
 
-            # 4. Volume surge index
-            avg_volume = df_symbol['volume'].rolling(window).mean()
+            # 3) Price position within recent high/low range (full windows only)
+            high_w = df_symbol['high'].rolling(**rp).max()
+            low_w = df_symbol['low'].rolling(**rp).min()
+            df_symbol['price_position'] = ((df_symbol['close'] - low_w) / (high_w - low_w + 1e-6)).fillna(0)
+
+            # 4) Volume surge versus rolling mean (full windows only)
+            avg_volume = df_symbol['volume'].rolling(**rp).mean()
             df_symbol['volume_surge'] = (df_symbol['volume'] / (avg_volume + 1e-6)).fillna(0)
 
-            # 5. Trend slope (via linear regression)
-            df_symbol['trend_slope'] = df_symbol['close'].rolling(window).apply(slope_func, raw=False).fillna(0)
+            # 5) Trend slope (safe slope_func already handles NaNs/constant windows)
+            df_symbol['trend_slope'] = df_symbol['close'].rolling(**rp).apply(slope_func, raw=False).fillna(0)
 
-            # 6. Moving average of close
-            df_symbol['moving_avg'] = df_symbol['close'].rolling(window).mean().bfill()
-            
+            # 6) Moving average of close (use full windows; then backfill the head)
+            df_symbol['moving_avg'] = df_symbol['close'].rolling(**rp).mean().bfill().fillna(0)
+
+            # --- Final safety pass before scaling ---
+            df_symbol = df_symbol.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
             # --- Min-Max scaling for price features ---
-            for col in ['open', 'high', 'low', 'close', 'vwap']: # Loop through price columns
-                min_val = df_symbol[col].min() # Extract the minimum value
-                max_val = df_symbol[col].max() # Extract the maximum value
-                range_val = max_val - min_val if max_val != min_val else 1.0  # Calculate the range - prevent divide-by-zero
-                df_symbol[col] = (df_symbol[col] - min_val) / range_val # Normalise, feature = (value - minimum) / range
+            for col in ['open', 'high', 'low', 'close', 'vwap']:
+                col_min = df_symbol[col].min()
+                col_max = df_symbol[col].max()
+                rng = col_max - col_min if col_max != col_min else 1.0
+                df_symbol[col] = (df_symbol[col] - col_min) / rng
 
             # --- Log + Min-Max scaling for volume/count ---
-            for col in ['volume', 'count']: # Loop through volume & count columns
-                df_symbol[col] = np.log1p(df_symbol[col])  # Convert values to log(1 + x) to keep 0 valid
-                min_val = df_symbol[col].min() # Extract the minimum value
-                max_val = df_symbol[col].max() # Extract the maximum value
-                range_val = max_val - min_val if max_val != min_val else 1.0 # Calculate the logarithmic range - prevent divide-by-zero
-                df_symbol[col] = (df_symbol[col] - min_val) / range_val # Normalise, feature = (log(1 + value) - log_minimum) / log_range
+            for col in ['volume', 'count']:
+                x = np.log1p(df_symbol[col].clip(lower=0))  # keep non-negative, guard tiny negatives
+                vmin, vmax = x.min(), x.max()
+                vrng = vmax - vmin if vmax != vmin else 1.0
+                df_symbol[col] = (x - vmin) / vrng
 
-            # Engineered features: min-max scale
+            # --- Engineered features: min-max scale individually ---
             for col in added_features:
-                min_val, max_val = df_symbol[col].min(), df_symbol[col].max()
-                range_val = max_val - min_val
-                df_symbol[col] = (df_symbol[col] - min_val) / (range_val if range_val != 0 else 1.0)
+                vmin, vmax = df_symbol[col].min(), df_symbol[col].max()
+                vrng = vmax - vmin if vmax != vmin else 1.0
+                df_symbol[col] = (df_symbol[col] - vmin) / vrng
 
+            # --- One last finite check (belt & braces) ---
+            df_symbol = df_symbol.replace([np.inf, -np.inf], 0.0).fillna(0.0)
 
-            # Populate the tensor slice for this crypto - Final shape [T, F]
-            tensor[:, i, :] = df_symbol[all_features].to_numpy() # Fill tensor with normalized data and additional features for symbol[i]
+            # Populate tensor slice
+            tensor[:, i, :] = df_symbol[all_features].to_numpy(dtype=np.float32)
 
-        return tensor # Return tensor (3 Dimensions) containing all data with shape [Timesteps, Cryptos, Features] and type np Float32
+        return tensor
 
     def reset(self, *, seed=None, options=None):
         """
@@ -301,12 +328,16 @@ class CryptoTradingEnv(gym.Env):
         time_remaining = (self.timeout_steps - (self.current_step - self.start_index)) / self.timeout_steps
         time_remaining = np.clip(time_remaining, 0.0, 1.0)
 
-        # 2. Current profit (if holding)
+        # 2. Current profit (if holding) (LOW for mark-to-exit):
         if self.active_crypto_index is not None and self.buy_price > 0:
-            current_price = self.data[-1, self.active_crypto_index, 3]
-            current_profit = (current_price - self.buy_price) / self.buy_price
+            # current_price = self.data[self.current_step, self.active_crypto_index, LOW_IDX]
+            sym = self.crypto_codes[self.active_crypto_index]
+            current_price = float(self.raw_lookup[sym].iloc[self.current_step]["low"])
+            current_profit = (current_price - self.buy_price) / max(self.buy_price, 1e-12)
         else:
             current_profit = 0.0
+
+        current_profit = float(np.clip(current_profit, -10.0, 10.0)) # Clip profit to safe range 
 
         # 3. Held crypto (index or -1 if none) - using one-hot encoding
         held_one_hot = np.zeros(self.num_cryptos + 1, dtype=np.float32)
@@ -354,53 +385,13 @@ class CryptoTradingEnv(gym.Env):
         done = False
         profit = 0
 
-        # If the action is Buy - Buy Action range is 1:num_cryptos (for #num_cryptos cryptos)
-        if 1 <= action <= self.num_cryptos:  # Buy crypto[i]
-            if self.active_crypto_index is None: # Check whether we already holding a crypto - prevents double buying
-                self.active_crypto_index = action - 1 # Set active crypto index - Adjust index by -1 to match 0-based indexing
-                self.buy_price = self.data[self.current_step, self.active_crypto_index, 3] # Capture buy price at the current step from the close feature (index 3)
-                reward = self._calculate_reward(0.0, "BUY", price_series=self._get_price_series())
-            else: # If we are already holding a crypto then give a small negative reward - teaches the agent the legal moves
-                reward = -0.1  # Penalty: already holding
-        
-        # If the Action is Hold - 0 = Hold
-        elif action == 0:  # Hold
-            if self.active_crypto_index is not None: # If we are holding a crypto
-                price_now = self.data[self.current_step, self.active_crypto_index, 3] # Save the current price
-                if self.buy_price is None or self.buy_price == 0 or np.isnan(self.buy_price): # Calculate the current profit
-                    profit = 0  # or np.nan or some fallback strategy
-                else:
-                    profit = (price_now - self.buy_price) / self.buy_price
-                reward = self._calculate_reward(profit, "HOLD") # Calculate the reward at this time step (dense)
-
-                if abs(profit) < 0.001: # If the profit is near 0
-                    self.break_even_steps += 1 # Increment the break_even_steps up - assists discouraging break-even trades
-                else: # If we have made positive/negative profit
-                    self.break_even_steps = 0  # Reset the break_even_steps
-            else: # If we are not holding a crypto then give a small negative reward - teaches the agent the legal moves
-                reward = -0.1  # Penalty: holding nothing
-
-        # If the Action if Sell - num_cryptos + 1 = Sell
-        elif action == self.num_cryptos + 1:  # Sell
-            if self.active_crypto_index is not None: # Check whether we are holding a crypto - prevents double selling
-                sell_price = self.data[self.current_step, self.active_crypto_index, 3] # Take the price at the current step for the current crypto as the sell price
-                if self.buy_price is None or self.buy_price == 0 or np.isnan(self.buy_price): # Calculate the total profit
-                    profit = 0  # or handle however you prefer (e.g., skip trade)
-                else:
-                    profit = (sell_price - self.buy_price) / self.buy_price
-                self.portfolio_value *= (1 + profit) # Calculate the final portfolio value
-                reward = self._calculate_reward(profit,"SELL") # Calculate the final reward for the episode
-                self._end_episode() # End the episode
-                done = True # Reset done flag
-            else: # If we are not holding a crypto then give a small negative reward - teaches the agent the legal moves
-                reward = -0.1  # Penalty: nothing to sell
-
-        # If we have exceeded the timout steps for this episode
+        #### TIMEOUT HANDLING ####
         if self.global_step - self.start_step >= self.timeout_steps: # Check whether we have exceeded the timeout steps for this episode
             done = True # Reset done flag
             if self.active_crypto_index is not None: # Check whether there is an active crypto
                 symbol = self.crypto_codes[self.active_crypto_index] # Grab the active symbol we are selling
-                final_price = self.data[self.current_step, self.active_crypto_index, 3] # Grab the final price
+                # final_price = self.data[self.current_step, self.active_crypto_index, LOW_IDX] # Grab the final price - low feature
+                final_price = float(self.raw_lookup[symbol].iloc[self.current_step]["close"]) # use raw low price for sell
                 # Calculate the final profit
                 if self.buy_price is None or self.buy_price == 0 or np.isnan(self.buy_price):
                     profit = 0
@@ -412,7 +403,7 @@ class CryptoTradingEnv(gym.Env):
                 raw_price = None
                 if symbol in self.raw_lookup:
                     try:
-                        raw_price = float(self.raw_lookup[symbol].iloc[self.current_step]["close"])
+                        raw_price = float(self.raw_lookup[symbol].iloc[self.current_step]["low"]) # use low price for sell
                     except:
                         raw_price = None
 
@@ -437,48 +428,61 @@ class CryptoTradingEnv(gym.Env):
                 }
                 self._end_episode() # End the episode
 
-        # --- Periodically load a new 10k-row dataset every 10k steps ---
-        if (self.global_step + 1) % 10000 == 0:
-            chunk_index = (self.global_step // 10000) + 1
-            chunk_path = f"/home/jarred/git/ServoTrader/data/split_10k_chunks_ancient/{chunk_index:03}.csv"
+        ### BUY ACTION ###
+        # If the action is Buy - Buy Action range is 1:num_cryptos (for #num_cryptos cryptos)
+        elif 1 <= action <= self.num_cryptos:  # Buy crypto[i]
+            if self.active_crypto_index is None: # Check whether we already holding a crypto - prevents double buying
+                self.active_crypto_index = action - 1 # Set active crypto index - Adjust index by -1 to match 0-based indexing
+                # self.buy_price = self.data[self.current_step, self.active_crypto_index, HIGH_IDX] # Capture buy price at the current step from the high feature
+                symbol = self.crypto_codes[self.active_crypto_index] # Grab the symbol we are buying
+                # self.buy_price = float(self.raw_lookup[symbol].iloc[self.current_step]["high"]) # use raw high price for buy
+                self.buy_price = float(self.raw_lookup[symbol].iloc[self.current_step]["close"]) # use raw close price for buy
+                reward = self._calculate_reward(0.0, "BUY", price_series=self._get_price_series())
+            else: # If we are already holding a crypto then give a small negative reward - teaches the agent the legal moves
+                reward = -0.1  # Penalty: already holding
+        
+        ### HOLD ACTION ###
+        # If the Action is Hold - 0 = Hold
+        elif action == 0:  # Hold
+            if self.active_crypto_index is not None: # If we are holding a crypto
+                # price_now = self.data[self.current_step, self.active_crypto_index, LOW_IDX] # Save the current price from the low feature
+                symbol = self.crypto_codes[self.active_crypto_index] # Grab the active symbol we are holding
+                # price_now = float(self.raw_lookup[symbol].iloc[self.current_step]["low"]) # use raw low price for profit calc
+                price_now = float(self.raw_lookup[symbol].iloc[self.current_step]["close"]) # use raw close price for profit calc
+                if self.buy_price is None or self.buy_price == 0 or np.isnan(self.buy_price): # Calculate the current profit
+                    profit = 0  # or np.nan or some fallback strategy
+                else:
+                    profit = (price_now - self.buy_price) / self.buy_price
+                reward = self._calculate_reward(profit, "HOLD") # Calculate the reward at this time step (dense)
 
-            print(f"📦 Loading dataset chunk: {chunk_path}")
-            if not os.path.exists(chunk_path):
-                raise FileNotFoundError(f"❌ Chunk {chunk_index:03}.csv not found!")
+                if abs(profit) < 0.001: # If the profit is near 0
+                    self.break_even_steps += 1 # Increment the break_even_steps up - assists discouraging break-even trades
+                else: # If we have made positive/negative profit
+                    self.break_even_steps = 0  # Reset the break_even_steps
+            else: # If we are not holding a crypto then give a small negative reward - teaches the agent the legal moves
+                reward = -0.1  # Penalty: holding nothing
 
-            new_df = pd.read_csv(chunk_path)
-
-            self.raw_df = new_df.copy()
-            self.raw_df["symbol"] = self.raw_df["symbol"].str.strip()
-            self.raw_lookup = {
-                sym: df.reset_index(drop=True)
-                for sym, df in self.raw_df.groupby("symbol")
-            }
-
-            self.data = self.preprocess_data(new_df)
-            self.num_timesteps, self.num_cryptos, self.features_per_crypto = self.data.shape
-
-            self.current_step = 0  # ✅ Reset local index
-            print(f"✅ Chunk {chunk_index:03}.csv loaded and preprocessed")
-
-        else:
-            self.current_step += 1  # Continue stepping normally
-
-        obs = self._get_observation() # Grab the current observation
-
-        # --- Sanitize reward ---
-        if np.isnan(reward) or np.isinf(reward):
-            print(f"[Warning] Invalid reward encountered at step {self.current_step}: {reward}")
-            reward = 0.0
-
-        # --- Sanitize observation ---
-        if np.any(np.isnan(obs)) or np.any(np.isinf(obs)):
-            print(f"[Warning] Invalid observation at step {self.current_step}")
-            obs = np.nan_to_num(obs, nan=0.0, posinf=1e6, neginf=-1e6)
+        ### SELL ACTION ###
+        # If the Action if Sell - num_cryptos + 1 = Sell
+        elif action == self.num_cryptos + 1:  # Sell
+            if self.active_crypto_index is not None: # Check whether we are holding a crypto - prevents double selling
+                # sell_price = self.data[self.current_step, self.active_crypto_index, LOW_IDX] # Take the LOW price at the current step for the current crypto as the sell price
+                symbol = self.crypto_codes[self.active_crypto_index] # Grab the active symbol we are selling
+                sell_price = float(self.raw_lookup[symbol].iloc[self.current_step]["close"]) # use raw low price for sell
+                if self.buy_price is None or self.buy_price == 0 or np.isnan(self.buy_price): # Calculate the total profit
+                    profit = 0  # or handle however you prefer (e.g., skip trade)
+                else:
+                    profit = (sell_price - self.buy_price) / self.buy_price
+                self.portfolio_value *= (1 + profit) # Calculate the final portfolio value
+                reward = self._calculate_reward(profit, "SELL") # Calculate the final reward for the episode
+                self._end_episode() # End the episode
+                done = True # Reset done flag
+            else: # If we are not holding a crypto then give a small negative reward - teaches the agent the legal moves
+                reward = -0.1  # Penalty: nothing to sell
 
         terminated = done # Terminated & done will be the same for our application
         truncated = (self.global_step - self.start_step) >= self.timeout_steps # Truncated is true if the total steps of the episode exceeds the timeout steps
-        info = {}
+        info = {}   
         # Log the reason the episode ended
         # if terminated:
         #     if truncated:
@@ -490,19 +494,20 @@ class CryptoTradingEnv(gym.Env):
         step_offset = int(self.global_step - self.start_step)  # Ensure it's native int for JSON
 
         # Initialize placeholders for price/profit values
-        current_price = None       # Normalized close price
-        profit = None              # Profit percentage
-        raw_price = None           # Raw close price
+        current_price = None       # Normalized price
+        log_profit_pct = None              # Profit percentage
+        raw_price = None           # Rawprice
         raw_buy_price = None       # Buy price from raw data
         raw_sell_price = None      # Sell price from raw data
 
         # If currently holding a crypto, compute prices and profit
         if self.active_crypto_index is not None:
-            current_price = float(self.data[self.current_step, self.active_crypto_index, 3])  # Normalized close
-            profit = ((current_price - self.buy_price) / self.buy_price) * 100 if self.buy_price else 0.0
-            symbol = self.crypto_codes[self.active_crypto_index]
+            # current_price = float(self.data[self.current_step, self.active_crypto_index, LOW_IDX])  # Normalized low
+            symbol = self.crypto_codes[self.active_crypto_index] # Grab the active symbol we are holding
+            current_price = float(self.raw_lookup[symbol].iloc[self.current_step]["close"])  # Raw low price
+            log_profit_pct = ((current_price - self.buy_price) / self.buy_price) * 100 if self.buy_price else 0.0
             if symbol in self.raw_lookup:
-                raw_price = float(self.raw_lookup[symbol].iloc[self.current_step]["close"])  # Raw close price
+                raw_price = float(self.raw_lookup[symbol].iloc[self.current_step]["close"])  # Raw low price
 
         # Create the base JSON record for this step
         step_event = {
@@ -516,12 +521,13 @@ class CryptoTradingEnv(gym.Env):
         if self.active_crypto_index is not None:
             step_event["symbol"] = symbol
             step_event["price"] = raw_price if raw_price is not None else current_price
-            step_event["profit_pct"] = float(profit)
+            step_event["profit_pct"] = float(log_profit_pct)
 
         # --- BUY action logging ---
         if 1 <= action <= self.num_cryptos:
             buy_symbol = self.crypto_codes[action - 1]
             if buy_symbol in self.raw_lookup:
+                # raw_buy_price = float(self.raw_lookup[buy_symbol].iloc[self.current_step]["high"])
                 raw_buy_price = float(self.raw_lookup[buy_symbol].iloc[self.current_step]["close"])
             step_event["action_type"] = "buy"
             step_event["symbol"] = buy_symbol
@@ -582,6 +588,45 @@ class CryptoTradingEnv(gym.Env):
                     f.write(json.dumps(record) + "\n")
 
             self.episode_log = []  # Clear buffer for next episode
+
+        # --- Periodically load a new 10k-row dataset every 10k steps ---
+        if (self.global_step + 1) % 10000 == 0:
+            chunk_index = (self.global_step // 10000) + 1
+            chunk_path = f"/home/jarred/git/ServoTrader/data/split_10k_chunks_ancient/{chunk_index:03}.csv"
+
+            print(f"📦 Loading dataset chunk: {chunk_path}")
+            if not os.path.exists(chunk_path):
+                raise FileNotFoundError(f"❌ Chunk {chunk_index:03}.csv not found!")
+
+            new_df = pd.read_csv(chunk_path)
+
+            self.raw_df = new_df.copy()
+            self.raw_df["symbol"] = self.raw_df["symbol"].str.strip()
+            self.raw_lookup = {
+                sym: df.reset_index(drop=True)
+                for sym, df in self.raw_df.groupby("symbol")
+            }
+
+            self.data = self.preprocess_data(new_df)
+            self.num_timesteps, self.num_cryptos, self.features_per_crypto = self.data.shape
+
+            self.current_step = 0  # ✅ Reset local index
+            print(f"✅ Chunk {chunk_index:03}.csv loaded and preprocessed")
+
+        else:
+            self.current_step += 1  # Continue stepping normally
+
+        obs = self._get_observation() # Grab the current observation
+
+        # --- Sanitize reward ---
+        if np.isnan(reward) or np.isinf(reward):
+            print(f"[Warning] Invalid reward encountered at step {self.current_step}: {reward}")
+            reward = 0.0
+
+        # --- Sanitize observation ---
+        if np.any(np.isnan(obs)) or np.any(np.isinf(obs)):
+            print(f"[Warning] Invalid observation at step {self.current_step}")
+            obs = np.nan_to_num(obs, nan=0.0, posinf=1e6, neginf=-1e6)
 
         # Compute legal action mask
         action_mask = np.zeros(self.action_space.n, dtype=bool)
@@ -668,14 +713,13 @@ class CryptoTradingEnv(gym.Env):
         """
         # Save sell log data before resetting state
         if self.active_crypto_index is not None:
+            symbol = self.crypto_codes[self.active_crypto_index]
+            raw_low = float(self.raw_lookup[symbol].iloc[self.current_step]["close"])
             self._last_sell_context = {
-                "symbol": self.crypto_codes[self.active_crypto_index],
+                "symbol": symbol,
                 "buy_price": self.buy_price,
-                "sell_price": self.data[self.current_step, self.active_crypto_index, 3],
-                "profit": (
-                    (self.data[self.current_step, self.active_crypto_index, 3] - self.buy_price)
-                    / self.buy_price * 100 if self.buy_price else 0
-                )
+                "sell_price": raw_low,
+                "profit": (raw_low - self.buy_price) / max(self.buy_price, 1e-12) * 100.0
             }
 
         self.active_crypto_index = None
@@ -707,11 +751,18 @@ class CryptoTradingEnv(gym.Env):
         Returns: 
             A panda series of close-prices with length: [window]
         """
-        if self.active_crypto_index is None or self.current_step < window: # If there is an active crypto purchased or the current step is within the window
-            return None # Return nothing
-        return pd.Series(
-            self.data[self.current_step - window:self.current_step, self.active_crypto_index, 3]
-        ) # Return the close-prices of the active crypto over the given window
+        if self.active_crypto_index is None or self.current_step < window:
+            return None
+        sym = self.crypto_codes[self.active_crypto_index]
+        df = self.raw_lookup.get(sym)
+        if df is None or len(df) == 0:
+            return None
+        start = self.current_step - window
+        end = self.current_step
+        start = max(0, start)
+        end = min(end, len(df) - 1)
+        # Use iloc slice to keep alignment with current_step indexing
+        return pd.Series(df["close"].iloc[start:end+1].astype(float).values)
     
     def _get_action_mask(self):
         """
