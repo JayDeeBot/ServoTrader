@@ -59,19 +59,21 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import time
 import pandas as pd
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 import numpy as np
+from pathlib import Path
+import signal
+
 from stable_baselines3 import PPO  # Import the PPO (Proximal Policy Optimization algorithm) Agent
 from stable_baselines3.common.vec_env import DummyVecEnv
 from servo_trader.envs.crypto_trading_env import CryptoTradingEnv  # Import the custom training environment
-from stable_baselines3.common.callbacks import CheckpointCallback
+from stable_baselines3.common.callbacks import CheckpointCallback, BaseCallback
 from stable_baselines3.common.monitor import Monitor  # Necessary for monitoring rewards
 from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor
 from sb3_contrib import MaskablePPO, RecurrentPPO
 from sb3_contrib.common.wrappers import ActionMasker
 from wrappers.action_mask_wrapper import LSTMActionMaskWrapper
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import timedelta
 
 # --- Torch activation for policy kwargs (SiLU/Swish) ---
 # Using SiLU tends to work nicely with recurrent policies.
@@ -115,8 +117,9 @@ else:
         mask = np.zeros(env.action_space.n, dtype=bool)  # Start all as False
 
         if env.active_crypto_index is None:
-            # No crypto held → only Buy actions are legal
+            # No crypto held → only Buy and Not Buy actions are legal
             mask[1:env.num_cryptos + 1] = True
+            mask[2 + env.num_cryptos] = True                 # Not Buy (skip)
         else:
             # Crypto held → only Hold and Sell are legal
             mask[0] = True  # Hold
@@ -131,7 +134,6 @@ else:
         )
     ])
     env = VecMonitor(env)
-
 
 # =========================
 # SCHEDULE HELPERS (NEW)
@@ -283,16 +285,145 @@ class UpdateEntCoefCallback(BaseCallback):
 
 
 # =========================
+# Pause/Resume + Snapshot Control
+# =========================
+
+CONTROL_FILE = Path("/tmp/servotrader_train.ctrl")  # write: pause|resume|save|stop
+SNAP_DIR = Path("/home/jarred/git/ServoTrader/models/checkpoints")
+SNAP_DIR.mkdir(parents=True, exist_ok=True)
+
+_SIG_SAVE = False
+_SIG_TOGGLE_PAUSE = False
+
+def _signal_save(signum, frame):
+    global _SIG_SAVE
+    _SIG_SAVE = True
+
+def _signal_toggle_pause(signum, frame):
+    global _SIG_TOGGLE_PAUSE
+    _SIG_TOGGLE_PAUSE = True
+
+# Register Linux signals (optional convenience)
+try:
+    signal.signal(signal.SIGUSR1, _signal_save)         # kill -USR1 <pid> → snapshot
+    signal.signal(signal.SIGUSR2, _signal_toggle_pause) # kill -USR2 <pid> → toggle pause/resume
+except Exception:
+    # Not all platforms support these (e.g., Windows); safe to ignore
+    pass
+
+def safe_snapshot(model, tag="manual"):
+    """
+    Save a timestamped model snapshot + a small sidecar JSON with training state.
+    """
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base = SNAP_DIR / f"ppo_goku_{tag}_{ts}"
+    model.save(str(base))
+    meta = {
+        "num_timesteps": int(getattr(model, "num_timesteps", 0)),
+        "progress_remaining": float(getattr(model, "_current_progress_remaining", 1.0)),
+        "ent_coef": float(getattr(model, "ent_coef", 0.0)),
+        "timestamp": datetime.now().isoformat(),
+    }
+    with open(str(base) + ".meta.json", "w") as f:
+        json.dump(meta, f, indent=2)
+    print(f"[Snapshot] Saved {base}  (steps={meta['num_timesteps']})")
+    return base
+
+class PausableCallback(BaseCallback):
+    """
+    File- and signal-based pause/resume + save/stop control.
+
+    Commands (write one word into /tmp/servotrader_train.ctrl):
+      - pause     : pause at next callback point (safely idles GPU)
+      - resume    : resume if paused
+      - save      : save a snapshot and continue
+      - stop      : save a snapshot and end training
+
+    Signals:
+      - SIGUSR1   : save a snapshot and continue
+      - SIGUSR2   : toggle pause/resume
+    """
+    def __init__(self, check_interval_steps=1024, verbose=0):
+        super().__init__(verbose)
+        self.check_interval_steps = int(check_interval_steps)
+        self._paused = False
+        self._since_check = 0
+
+    def _handle_signals_and_file(self) -> bool:
+        """
+        Handle signals and control file. Returns False to request training stop.
+        """
+        global _SIG_SAVE, _SIG_TOGGLE_PAUSE
+
+        # Handle signals
+        if _SIG_SAVE:
+            _SIG_SAVE = False
+            safe_snapshot(self.model, tag="sigusr1")
+
+        if _SIG_TOGGLE_PAUSE:
+            _SIG_TOGGLE_PAUSE = False
+            self._paused = not self._paused
+            print(f"[PauseCtl] {'PAUSED' if self._paused else 'RESUMED'} via SIGUSR2")
+
+        # Handle control file
+        if CONTROL_FILE.exists():
+            cmd = CONTROL_FILE.read_text().strip().lower()
+            # clear it so one write → one action
+            try:
+                CONTROL_FILE.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+            if cmd in {"pause", "resume", "save", "stop"}:
+                if cmd == "pause":
+                    self._paused = True
+                    print("[PauseCtl] PAUSED (file)")
+                elif cmd == "resume":
+                    self._paused = False
+                    print("[PauseCtl] RESUMED (file)")
+                elif cmd == "save":
+                    safe_snapshot(self.model, tag="manual")
+                elif cmd == "stop":
+                    safe_snapshot(self.model, tag="stop")
+                    print("[PauseCtl] STOP requested — ending training after snapshot.")
+                    return False
+
+        # Pause loop (idle but responsive)
+        while self._paused:
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+            except Exception:
+                pass
+            time.sleep(2.0)
+            # allow control while paused
+            if not self._handle_signals_and_file():
+                return False
+        return True
+
+    def _on_step(self) -> bool:
+        self._since_check += 1
+        if self._since_check >= self.check_interval_steps:
+            self._since_check = 0
+            return self._handle_signals_and_file()
+        return True
+
+    def _on_training_end(self) -> None:
+        # Optional final snapshot
+        safe_snapshot(self.model, tag="final")
+
+
+# =========================
 # PPO HYPERPARAMETERS
 # =========================
 
 # --- Training budget and warmup for schedules ---
 TOTAL_TIMESTEPS = 1_000_000   # Adjust to your run budget
-WARMUP_UPDATES = 10_000       # 5_000–10_000 is typical for warmup
+WARMUP_UPDATES = 5_000       # 5_000–10_000 is typical for warmup
 
 # Build schedules
 lr_sched = make_lr_schedule(
-    lr_start=1e-4,
+    lr_start=5e-4,
     lr_end=3e-5,
     # lr_end=1.5e-5,
     warmup_steps=WARMUP_UPDATES,
@@ -303,19 +434,20 @@ ent_sched = make_entropy_schedule(ent_start=5e-3, ent_end=1e-3, decay_until_frac
 # Define PPO hyperparameters
 ppo_config = {
     # LR is a callable (SB3 supports this)
-    "learning_rate": lr_sched,
+    # "learning_rate": lr_sched,
+    "learning_rate": 3e-5,  # Fixed LR
 
     # IMPORTANT: keep ent_coef a float; we will update it via UpdateEntCoefCallback
     "ent_coef": 5e-3,
 
     # LSTM-friendly PPO core knobs
-    "n_steps": 64,                 # sequence length per update (unroll)
-    "batch_size": 32,              # should divide evenly into rollout_size across envs
+    "n_steps": 4096,                 # sequence length per update (unroll)
+    "batch_size": 1024,              # should divide evenly into rollout_size across envs
     "n_epochs": 10,         # number of times we iterate over the rollout buffer
     "gamma": 0.995,
-    "gae_lambda": 0.95,
-    "clip_range": 0.1,
-    "vf_coef": 0.65,
+    "gae_lambda": 0.97,
+    "clip_range": 0.2,
+    "vf_coef": 0.8,
     "max_grad_norm": 0.3,
     "normalize_advantage": True,
     "target_kl": 0.02,              # mild guardrail on destructive updates
@@ -332,7 +464,7 @@ ppo_config = {
         enable_critic_lstm=False,   # be explicit to avoid assertion ambiguity
         ortho_init=False,           # orthogonal + LSTM can over-scale early steps
         activation_fn=nn.SiLU,      # SiLU/Swish
-        net_arch=dict(pi=[128, 64], vf=[128, 64]),
+        net_arch=dict(pi=[128, 128], vf=[256, 256]),
     ),
 }
 
@@ -348,6 +480,9 @@ if CONTINUE_TRAINING:
         tensorboard_log=ppo_config["tensorboard_log"],
         device=ppo_config["device"]
     )
+    # Re-inject model into the LSTM action-mask wrapper if used
+    if USE_LSTM:
+        env.envs[0].model = model
 else:
     # --- Train new model ---
     if USE_LSTM:
@@ -368,12 +503,22 @@ checkpoint = CheckpointCallback(
 # Add callbacks:
 #  - UpdateEntCoefCallback: applies entropy schedule safely each rollout
 #  - LogSchedulesCallback: logs LR + current entropy coef to TensorBoard
+#  - PausableCallback: enables pause/resume/save/stop control
 callbacks = [
     checkpoint,
     UpdateEntCoefCallback(ent_schedule=ent_sched),
     LogSchedulesCallback(),
+    PausableCallback(check_interval_steps=512),  # NEW
 ]
-model.learn(total_timesteps=TOTAL_TIMESTEPS, callback=callbacks)
+
+if CONTINUE_TRAINING:
+    # Continue from current num_timesteps so schedules/progress align
+    remaining = max(TOTAL_TIMESTEPS - int(getattr(model, "num_timesteps", 0)), 0)
+    print(f"[Continue] Completed={model.num_timesteps}  Remaining={remaining}")
+    if remaining > 0:
+        model.learn(total_timesteps=remaining, callback=callbacks, reset_num_timesteps=False)
+else:
+    model.learn(total_timesteps=TOTAL_TIMESTEPS, callback=callbacks)
 
 # Save the total number of timesteps completed during training
 actual_timesteps = model.num_timesteps  # Real number of steps — could be > planned due to n_steps rounding
@@ -385,30 +530,31 @@ print(f"[TensorBoard] Logs saved to: {ppo_config['tensorboard_log']}")  # Check 
 # --- Log final training results as JSON ---
 env_instance = env.envs[0].env  # Unwrap the inner CryptoTradingEnv from the VecEnv stack
 
-total_return_pct = float(env_instance.total_profit_percent)  # grab the total return
+if env_instance.take_logs: # Only if logging was enabled
+    total_return_pct = float(env_instance.total_profit_percent)  # grab the total return
 
-# Geometric (compounded) daily return
-if simulated_days > 0 and total_return_pct > -100:
-    total_growth = 1 + (total_return_pct / 100)
-    daily_growth_factor = total_growth ** (1 / simulated_days)
-    compounded_daily_return_pct = (daily_growth_factor - 1) * 100
-else:
-    compounded_daily_return_pct = 0.0
+    # Geometric (compounded) daily return
+    if simulated_days > 0 and total_return_pct > -100:
+        total_growth = 1 + (total_return_pct / 100)
+        daily_growth_factor = total_growth ** (1 / simulated_days)
+        compounded_daily_return_pct = (daily_growth_factor - 1) * 100
+    else:
+        compounded_daily_return_pct = 0.0
 
-# Build a structured summary object
-training_summary = {
-    "type": "training_complete",                              # event type
-    "total_episodes": env_instance.episode_counter,           # number of completed episodes
-    "total_return_pct": float(env_instance.total_profit_percent),  # cumulative return (float)
-    "total_timesteps": int(actual_timesteps),  # total simulated minutes
-    "simulated_days": simulated_days,  # total simulated days
-    "compounded_daily_return_pct": compounded_daily_return_pct,  # compound daily return
-    "timestamp": datetime.now().isoformat()  # timestamp of training end
-}
+    # Build a structured summary object
+    training_summary = {
+        "type": "training_complete",                              # event type
+        "total_episodes": env_instance.episode_counter,           # number of completed episodes
+        "total_return_pct": float(env_instance.total_profit_percent),  # cumulative return (float)
+        "total_timesteps": int(actual_timesteps),  # total simulated minutes
+        "simulated_days": simulated_days,  # total simulated days
+        "compounded_daily_return_pct": compounded_daily_return_pct,  # compound daily return
+        "timestamp": datetime.now().isoformat()  # timestamp of training end
+    }
 
-# Append this record at the end of the JSONL log
-with open(env_instance.log_path, "a") as f:
-    f.write(json.dumps(training_summary) + "\n\n")
+    # Append this record at the end of the JSONL log
+    with open(env_instance.log_path, "a") as f:
+        f.write(json.dumps(training_summary) + "\n\n")
 
 # --- Save final model ---
 model.save("/home/jarred/git/ServoTrader/models/ppo_goku")
