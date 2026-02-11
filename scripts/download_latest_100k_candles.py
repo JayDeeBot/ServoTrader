@@ -18,11 +18,11 @@ from datetime import datetime, timezone, timedelta
 # --- CONFIG ---
 BINANCE_API_KEY = "6BZOFxkzIau3dqljZu8tbbKY5tZxnptRJkOfHq6Nx5jZDbvogxseqFkaQ3RnuaBE"
 BINANCE_SECRET = "6vguZphjUuW9t6SdPZUxImWNzB2anPr91jAWHw9dwIASLeFAVnbQQMZi0iZVBdru"
-CODES_JSON_PATH = "/home/jarred/git/ServoTrader/servo_trader/config/crypto_code_sundries.json"
+CODES_JSON_PATH = "/home/jarred/git/ServoTrader/servo_trader/config/crypto_codes_modern.json"
 FULL_DATASET_CSV = "/home/jarred/git/ServoTrader/data/latest_100k_dataset.csv"
-INDIVIDUAL_FOLDER = "/home/jarred/git/ServoTrader/data/individual_crypto_csvs"
-INTERVAL = '1m'
-MAX_CANDLES = 100_000
+INDIVIDUAL_FOLDER = "/home/jarred/git/ServoTrader/data/individual_crypto_csvs_modern_5_min"
+INTERVAL = '5m'
+MAX_CANDLES = 20_000
 LIMIT = 1000
 SLEEP_BETWEEN_REQUESTS = 0.4
 

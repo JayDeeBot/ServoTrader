@@ -119,7 +119,7 @@ else:
         if env.active_crypto_index is None:
             # No crypto held → only Buy and Not Buy actions are legal
             mask[1:env.num_cryptos + 1] = True
-            mask[2 + env.num_cryptos] = True                 # Not Buy (skip)
+            # mask[2 + env.num_cryptos] = True                 # Not Buy (skip)
         else:
             # Crypto held → only Hold and Sell are legal
             mask[0] = True  # Hold
@@ -441,8 +441,8 @@ ppo_config = {
     "ent_coef": 5e-3,
 
     # LSTM-friendly PPO core knobs
-    "n_steps": 4096,                 # sequence length per update (unroll)
-    "batch_size": 1024,              # should divide evenly into rollout_size across envs
+    "n_steps": 500,                 # sequence length per update (unroll)
+    "batch_size": 100,              # should divide evenly into rollout_size across envs
     "n_epochs": 10,         # number of times we iterate over the rollout buffer
     "gamma": 0.995,
     "gae_lambda": 0.97,
@@ -452,14 +452,14 @@ ppo_config = {
     "normalize_advantage": True,
     "target_kl": 0.02,              # mild guardrail on destructive updates
 
-    "device": DEVICE,                # auto-select GPU/CPU
+    "device": DEVICE,                # auto-selects GPU/CPU
     "verbose": 1,
     "tensorboard_log": "/home/jarred/git/ServoTrader/logs",
 
     # Policy network (LSTM + MLP heads)
     "policy_kwargs": dict(
-        lstm_hidden_size=256,
-        n_lstm_layers=1,            # stick to 1 layer for now
+        lstm_hidden_size=100,     # size of LSTM hidden state
+        n_lstm_layers=3,            # stick to 1 layer for now
         shared_lstm=False,          # actor-only LSTM
         enable_critic_lstm=False,   # be explicit to avoid assertion ambiguity
         ortho_init=False,           # orthogonal + LSTM can over-scale early steps

@@ -8,12 +8,12 @@ from datetime import datetime, timezone, timedelta
 # --- CONFIG ---
 BINANCE_API_KEY = "6BZOFxkzIau3dqljZu8tbbKY5tZxnptRJkOfHq6Nx5jZDbvogxseqFkaQ3RnuaBE"
 BINANCE_SECRET = "6vguZphjUuW9t6SdPZUxImWNzB2anPr91jAWHw9dwIASLeFAVnbQQMZi0iZVBdru"
-CODES_JSON_PATH = "/home/jarred/git/ServoTrader/servo_trader/config/crypto_code_sundries.json"
+CODES_JSON_PATH = "/home/jarred/git/ServoTrader/servo_trader/config/crypto_codes_ancient_2.json"
 FULL_DATASET_CSV = "/home/jarred/git/ServoTrader/data/large_historical_dataset.csv"
-INDIVIDUAL_FOLDER = "/home/jarred/git/ServoTrader/data/individual_crypto_csvs_ancient_2"
-INTERVAL = '1m'
+INDIVIDUAL_FOLDER = "/home/jarred/git/ServoTrader/data/individual_crypto_csvs_ancient_15_min_2"
+INTERVAL = '1d'
 START_DATE = '2021-01-01T00:00:00Z'
-MAX_CANDLES = 1_000_000
+MAX_CANDLES = 66666
 LIMIT = 1000
 SLEEP_BETWEEN_REQUESTS = 0.5
 
@@ -37,7 +37,7 @@ total_codes = len(crypto_codes)
 start_time = time.time()
 
 for i, symbol in enumerate(crypto_codes):
-    print(f"\n🚀 [{i+1}/{total_codes}] Fetching {MAX_CANDLES} 1m candles for {symbol}...")
+    print(f"\n🚀 [{i+1}/{total_codes}] Fetching {MAX_CANDLES} {INTERVAL} candles for {symbol}...")
     since = binance.parse8601(START_DATE)
     collected = []
 

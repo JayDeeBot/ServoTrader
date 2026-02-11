@@ -59,10 +59,11 @@ import os
 from datetime import datetime
 import json
 from scipy.stats import linregress
+from typing import Dict, Tuple, Optional
 
 BUY_INDEX = "close" # Buy at the close/high price
-SELL_INDEX = "low" # Sell at the low/close price
-HOLD_INDEX = "low" # Hold at the low/close price
+SELL_INDEX = "close" # Sell at the low/close price
+HOLD_INDEX = "close" # Hold at the low/close price
 
 class CryptoTradingEnv(gym.Env):
     """
@@ -109,38 +110,64 @@ class CryptoTradingEnv(gym.Env):
 
         self.num_timesteps, self.num_cryptos, self.features_per_crypto = self.data.shape # Use the total number of timesteps available in historical data
 
-        # # Action Space:
-        # # 0 = Hold
-        # # 1 to 100 = Buy symbol[i-1]
-        # # 101 = Sell
-        # self.action_space = spaces.Discrete(1 + self.num_cryptos + 1)
-
         # Action Space:
         # 0              = Hold
         # 1 to num_cryptos = Buy symbol[i-1]
         # (1 + num_cryptos) = Sell
-        # (2 + num_cryptos) = Not Buy (special skip option, only valid at episode start)
-        self.action_space = spaces.Discrete(1 + self.num_cryptos + 2)
+        self.action_space = spaces.Discrete(1 + self.num_cryptos + 1)
 
         # Observation Space: 
-        # Recent OHLCV (Open, High, Low, Close, Volume, vwap & count 
-        # + engineered features including [recent_return, volatility, price_position, volume_surge, trend_slope, moving_avg]) 
-        # totalling 13 features for 100 cryptos
+        # Engineered features including ['trend_ema_dev', 'momentum_rsi', 'vol_atr_norm', 'flow_cmf']
         # Current profit: Normalized percentage profit (0 if not holding)
         # Held crypto: Index of held crypto, or a special value if none held
-        obs_len = self.history_window * self.num_cryptos * self.features_per_crypto + 2 + self.num_cryptos + 1 # Calculate the length of the observation
-        low  = np.zeros(obs_len, dtype=np.float32) # Set the lower bound
-        high = np.ones(obs_len,  dtype=np.float32) # Set the upper bound
+        FEATURES_PER_CRYPTO = self.features_per_crypto  # should be 4
+        H = int(self.history_window)
+        C = int(self.num_cryptos)
+
+        # --- lengths ---
+        FEATURE_BLOCK_LEN = H * C * FEATURES_PER_CRYPTO          # history of lean features
+        TIME_LEN          = 1                                    # normalized time remaining in episode [0,1]
+        PROFIT_LEN        = 1                                    # normalized PnL or unrealized PnL
+        ONE_HOT_LEN       = C + 1                                # +1 for "no position"
+
+        obs_len = FEATURE_BLOCK_LEN + TIME_LEN + PROFIT_LEN + ONE_HOT_LEN
+
+        # --- bounds ---
+        # Lean features: keep broad but finite bounds (engineered features are roughly small)
+        # - trend_ema_dev: typically ~[-0.2, +0.2], but allow +/-5
+        # - momentum_rsi:  [0,1]
+        # - vol_atr_norm:  small positive; allow [0,1]
+        # - flow_cmf:      [-1,1]
+        # For simplicity and safety across all features/history, we’ll set a broad default
+        # and then tighten known-bounded parts (time_remaining, profit & one-hot).
+        low  = np.full(obs_len, -5.0, dtype=np.float32)
+        high = np.full(obs_len,  5.0, dtype=np.float32)
+
         # Indices:
-        ONE_HOT_LEN = self.num_cryptos + 1
-        PROFIT_IDX  = obs_len - ONE_HOT_LEN - 1  # profit sits just before the one-hot block
-        # Allow profit to be negative/positive (e.g., -10..+10 for +/-1000%)
+        # time_remaining sits right after the feature block
+        TIME_IDX   = FEATURE_BLOCK_LEN
+        # profit comes right after time_remaining
+        PROFIT_IDX = TIME_IDX + 1
+        # one-hot starts after profit
+        ONE_HOT_START = PROFIT_IDX + 1
+        ONE_HOT_END   = ONE_HOT_START + ONE_HOT_LEN
+
+        # time_remaining is strictly [0,1]
+        low[TIME_IDX]  = 0.0
+        high[TIME_IDX] = 1.0
+
+        # Profit can swing more; allow +/-1000% (i.e., +/-10 if you encode as fraction)
         low[PROFIT_IDX]  = -10.0
         high[PROFIT_IDX] =  10.0
+
+        # One-hot block at the end is strictly {0,1}
+        low[ONE_HOT_START:ONE_HOT_END]  = 0.0
+        high[ONE_HOT_START:ONE_HOT_END] = 1.0
+
         self.observation_space = spaces.Box(low=low, high=high, dtype=np.float32)
 
         # Internal Logging
-        self.take_logs = False # Flag to decide where we should take logs of the training session
+        self.take_logs = True # Flag to decide where we should take logs of the training session
         self.log_dir = "/home/jarred/git/ServoTrader/logs" # Directory containing the log
         os.makedirs(self.log_dir, exist_ok=True) # Ensure the log exists
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S") # Record the start datetime
@@ -149,117 +176,229 @@ class CryptoTradingEnv(gym.Env):
         self.total_profit_percent = 0  # For global tracking of the profit
         self.episode_counter = 0 # Stores the episode count
 
-    def preprocess_data(self, raw_df):
+    def preprocess_data(self, raw_df: pd.DataFrame) -> np.ndarray:
         """
-        Converts the stacked CSV format into a 3D tensor: [timesteps, symbols, features]
-        Normalises the features (min/max scaling for price & log min/max scaling for volume/count) 
-        & Fills in Na's with forward/backward fill
-        Computes and incorporates the following additional features:
-            - Recent return
-            - Volatility
-            - Price position
-            - Volume surge
-            - Trend slope 
-            - Moving avg
-        
-        Args: 
-            raw_df: The raw crypto data (csv format)
+        Build a 3D observation tensor per symbol that includes raw OHLC context **and**
+        four engineered features. The engineered features are computed using the **LOW**
+        price wherever that is statistically meaningful; CLOSE is only used where the
+        classic definition would otherwise degenerate (notably, CMF).
 
-        Updates: 
-            crypto_codes 
-            num_cryptos
-            features_per_crypto
-            num_timesteps
+        ----------------------
+        OUTPUT (per time t, per symbol s)
+        ----------------------
+        Feature order (8 total):
+        1) open_norm(t,s)    : Min–max normalized OPEN
+        2) high_norm(t,s)    : Min–max normalized HIGH
+        3) low_norm(t,s)     : Min–max normalized LOW
+        4) close_norm(t,s)   : Min–max normalized CLOSE
+        5) trend_ema_dev_low : LOW / EMA(LOW, span=30) - 1
+        6) momentum_rsi_low  : RSI computed on LOW (Wilder smoothing, N=20), scaled to [0,1]
+        7) vol_atr_norm_low  : ATR(High, Low, PrevClose) / |LOW|
+        8) flow_cmf          : Chaikin Money Flow (N=20) using **standard definition with CLOSE**
+                                (Using LOW here would collapse MFM to -1 when High!=Low.)
 
-        Returns:
-            tensor (Float32): 3D Tensor containing all data with shape [Timesteps, Cryptos, Features] and type np Float32
+        ----------------------
+        ENGINEERED FEATURES (details)
+        ----------------------
+        1) trend_ema_dev_low (span=30)
+        EMA_t(low) = α*Low_t + (1-α)*EMA_{t-1}(low), α = 2/(N+1), N=30
+        trend_ema_dev_low = Low_t / EMA_t(low) - 1
+
+        2) momentum_rsi_low (period=20; scaled to [0,1])
+        Δ = Low_t - Low_{t-1}
+        AvgGain, AvgLoss via Wilder exponential smoothing (α=1/N, N=20)
+        RS  = AvgGain / AvgLoss
+        RSI = 100 - 100/(1+RS)  → divide by 100 to map to [0,1]
+
+        NOTE: Using LOW instead of CLOSE is acceptable—RSI is a generic oscillator on any price series.
+
+        3) vol_atr_norm_low (ATR period=20; normalized by |LOW|)
+        True Range TR_t = max(High-Low, |High-PrevClose|, |Low-PrevClose|)
+        ATR = EWM(TR, α=1/N) with N=20
+        vol_atr_norm_low = ATR / |Low_t|
+        Rationale: keep the standard TR/ATR definition (it depends on PrevClose),
+        but normalize by LOW to follow your "use low where possible" requirement.
+
+        4) flow_cmf (window=20; standard Chaikin Money Flow)
+        Money Flow Multiplier: MFM = ((Close-Low) - (High-Close)) / (High-Low)
+        Money Flow Volume:     MFV = MFM * Volume
+        CMF_N = sum(MFV over N) / sum(Volume over N)
+
+        IMPORTANT: If we replaced CLOSE with LOW, MFM would become -1 for High>Low,
+        collapsing the indicator. So we **retain CLOSE** here.
+
+        ----------------------
+        WINDOWS & WARM-UP
+        ----------------------
+        - EMA span: 30
+        - RSI period: 20
+        - ATR period: 20
+        - CMF window: 20
+        - We require fully-formed windows for all features, so we drop the first `discard=30` rows.
+        For each symbol series of length L, we output L-30 rows (time-aligned across symbols).
+
+        ----------------------
+        DATA HYGIENE
+        ----------------------
+        - Sort each symbol chronologically by 'timestamp' if present.
+        - Replace ±inf → NaN; ffill/bfill price columns (open/high/low/close/vwap).
+        - Fill volume/count NaNs with 0.
+        - Guard divisions with small epsilon.
+        - OHLC are min–max scaled per symbol to [0,1] before dropping warm-up so magnitudes
+        are comparable. (If you prefer raw OHLC, comment out the min–max section.)
+
+        ----------------------
+        SIDE EFFECTS (class state)
+        ----------------------
+        - self.crypto_codes: alphabetical symbol list
+        - self.num_cryptos: number of symbols
+        - self.features_per_crypto: 8
+        - self.num_timesteps: common truncated length across symbols (after warm-up drop)
+
+        Returns
+        -------
+        tensor : np.ndarray, shape [timesteps, symbols, 8], dtype float32
         """
-        print("Preprocessing data...")
-        self.crypto_codes = sorted(raw_df['symbol'].unique())  # Ensure stable ordering
+        print("Preprocessing data (OHLC + 4 engineered; LOW-centric)…")
+
+        # ---------- Config ----------
+        w_ema = 30   # EMA span for trend deviation
+        w_rsi = 20   # RSI period
+        w_atr = 20   # ATR period
+        w_cmf = 20   # CMF rolling window
+        discard = max(w_ema, w_rsi, w_atr, w_cmf)  # ensure all features are fully formed
+        eps = 1e-9
+
+        # ---------- Symbol setup & alignment ----------
+        self.crypto_codes = sorted(raw_df['symbol'].unique().tolist())
         self.num_cryptos = len(self.crypto_codes)
-        self.num_timesteps = raw_df.groupby('symbol').size().min()  # truncate to shortest
 
-        feature_cols = ['open', 'high', 'low', 'close', 'vwap', 'volume', 'count']
-        added_features = ['recent_return', 'volatility', 'price_position', 'volume_surge', 'trend_slope', 'moving_avg']
-        all_features = feature_cols + added_features
-        self.features_per_crypto = len(all_features)
+        per_len = {}
+        for sym in self.crypto_codes:
+            df_sym = raw_df[raw_df['symbol'] == sym]
+            if 'timestamp' in df_sym.columns:
+                df_sym = df_sym.sort_values('timestamp')
+            per_len[sym] = len(df_sym)
 
-        tensor = np.zeros((self.num_timesteps, self.num_cryptos, self.features_per_crypto), dtype=np.float32)
+        min_len = min(per_len.values()) if per_len else 0
+        if min_len <= discard:
+            raise ValueError(
+                f"Not enough bars per symbol to form features: min_len={min_len}, required>{discard}."
+            )
 
-        # Rolling params — using explicit min_periods to avoid partial-NaN windows
-        window = int(self.feature_window)
-        rp = dict(window=window, min_periods=window)
+        # Timesteps AFTER dropping warm-up
+        self.num_timesteps = min_len - discard
 
+        # ---------- Columns & output tensor ----------
+        price_cols  = ['open', 'high', 'low', 'close', 'vwap']
+        needed_cols = price_cols + ['volume', 'count']  # vwap for fill continuity; volume for CMF
+
+        feature_names = [
+            'open', 'high', 'low', 'close',
+            'trend_ema_dev_low', 'momentum_rsi_low', 'vol_atr_norm_low', 'flow_cmf'
+        ]
+        self.features_per_crypto = len(feature_names)
+
+        tensor = np.zeros(
+            (self.num_timesteps, self.num_cryptos, self.features_per_crypto),
+            dtype=np.float32
+        )
+
+        # ---------- Per-symbol processing ----------
         for i, symbol in enumerate(self.crypto_codes):
-            # --- Slice & coerce numeric ---
-            df_symbol = raw_df[raw_df['symbol'] == symbol].head(self.num_timesteps)
-            df_symbol = df_symbol[feature_cols].apply(pd.to_numeric, errors='coerce')
+            # Slice this symbol and sort chronologically
+            df_symbol = raw_df[raw_df['symbol'] == symbol]
+            if 'timestamp' in df_symbol.columns:
+                df_symbol = df_symbol.sort_values('timestamp')
 
-            # --- Sanitize infinities → NaN, then fill ---
+            # Truncate to the common aligned length
+            df_symbol = df_symbol.head(min_len)
+
+            # Keep only needed columns and coerce numeric
+            df_symbol = df_symbol[needed_cols].apply(pd.to_numeric, errors='coerce')
+
+            # Replace infinities; fill prices (ffill/bfill) to maintain level continuity
             df_symbol = df_symbol.replace([np.inf, -np.inf], np.nan)
-
-            # Fill prices with forward then backward fill (keeps level continuity)
-            price_cols = ['open', 'high', 'low', 'close', 'vwap']
             df_symbol[price_cols] = df_symbol[price_cols].ffill().bfill()
 
-            # Fill volume/count missing with 0 (natural baseline)
+            # Fill volume/count NaNs with a neutral baseline
             df_symbol[['volume', 'count']] = df_symbol[['volume', 'count']].fillna(0)
 
-            # If an entire series was NaN (edge cases), ensure no NaNs remain
+            # Last resort: ensure no NaNs remain in price columns
             df_symbol[price_cols] = df_symbol[price_cols].fillna(0.0)
 
-            # --- Engineered features (robust) ---
+            # Aliases
+            open_  = df_symbol['open']
+            high   = df_symbol['high']
+            low    = df_symbol['low']
+            close  = df_symbol['close']
+            volume = df_symbol['volume']
 
-            # 1) Recent return over window; guard inf from 0 denominators
-            rr = df_symbol['close'].pct_change(periods=window)
-            df_symbol['recent_return'] = rr.replace([np.inf, -np.inf], 0).fillna(0)
-
-            # 2) Historical volatility (std dev) with full valid windows only
-            df_symbol['volatility'] = df_symbol['close'].rolling(**rp).std().fillna(0)
-
-            # 3) Price position within recent high/low range (full windows only)
-            high_w = df_symbol['high'].rolling(**rp).max()
-            low_w = df_symbol['low'].rolling(**rp).min()
-            df_symbol['price_position'] = ((df_symbol['close'] - low_w) / (high_w - low_w + 1e-6)).fillna(0)
-
-            # 4) Volume surge versus rolling mean (full windows only)
-            avg_volume = df_symbol['volume'].rolling(**rp).mean()
-            df_symbol['volume_surge'] = (df_symbol['volume'] / (avg_volume + 1e-6)).fillna(0)
-
-            # 5) Trend slope (safe slope_func already handles NaNs/constant windows)
-            df_symbol['trend_slope'] = df_symbol['close'].rolling(**rp).apply(slope_func, raw=False).fillna(0)
-
-            # 6) Moving average of close (use full windows; then backfill the head)
-            df_symbol['moving_avg'] = df_symbol['close'].rolling(**rp).mean().bfill().fillna(0)
-
-            # --- Final safety pass before scaling ---
-            df_symbol = df_symbol.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-
-            # --- Min-Max scaling for price features ---
-            for col in ['open', 'high', 'low', 'close', 'vwap']:
+            # ---------- OHLC min–max scaling (per symbol) ----------
+            # Comment this block out if you prefer raw prices.
+            for col in ['open', 'high', 'low', 'close']:
                 col_min = df_symbol[col].min()
                 col_max = df_symbol[col].max()
-                rng = col_max - col_min if col_max != col_min else 1.0
-                df_symbol[col] = (df_symbol[col] - col_min) / rng
+                rng = (col_max - col_min) if col_max != col_min else 1.0
+                df_symbol[col + '_norm'] = ((df_symbol[col] - col_min) / (rng + eps)).astype(float)
 
-            # --- Log + Min-Max scaling for volume/count ---
-            for col in ['volume', 'count']:
-                x = np.log1p(df_symbol[col].clip(lower=0))  # keep non-negative, guard tiny negatives
-                vmin, vmax = x.min(), x.max()
-                vrng = vmax - vmin if vmax != vmin else 1.0
-                df_symbol[col] = (x - vmin) / vrng
+            # ---------- (1) TREND — EMA deviation using LOW ----------
+            ema_low = low.ewm(span=w_ema, adjust=False, min_periods=w_ema).mean()
+            trend_ema_dev_low = (low / (ema_low + eps) - 1.0).astype(float)
 
-            # --- Engineered features: min-max scale individually ---
-            for col in added_features:
-                vmin, vmax = df_symbol[col].min(), df_symbol[col].max()
-                vrng = vmax - vmin if vmax != vmin else 1.0
-                df_symbol[col] = (df_symbol[col] - vmin) / vrng
+            # ---------- (2) MOMENTUM — RSI on LOW (Wilder, N=20) ----------
+            d_low = low.diff()
+            gain = d_low.clip(lower=0)
+            loss = (-d_low).clip(lower=0)
+            avg_gain = gain.ewm(alpha=1.0 / w_rsi, min_periods=w_rsi, adjust=False).mean()
+            avg_loss = loss.ewm(alpha=1.0 / w_rsi, min_periods=w_rsi, adjust=False).mean()
+            rs  = avg_gain / (avg_loss + eps)
+            rsi = 100.0 - (100.0 / (1.0 + rs))
+            momentum_rsi_low = (rsi / 100.0).astype(float)  # map to [0,1]
 
-            # --- One last finite check (belt & braces) ---
-            df_symbol = df_symbol.replace([np.inf, -np.inf], 0.0).fillna(0.0)
+            # ---------- (3) VOLATILITY — ATR normalized by |LOW| ----------
+            # Keep the canonical TR definition that uses PrevClose for gap risk.
+            prev_close = close.shift(1)
+            tr1 = (high - low).abs()
+            tr2 = (high - prev_close).abs()
+            tr3 = (low  - prev_close).abs()
+            true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+            atr = true_range.ewm(alpha=1.0 / w_atr, min_periods=w_atr, adjust=False).mean()
+            vol_atr_norm_low = (atr / (low.abs() + eps)).astype(float)
 
-            # Populate tensor slice
-            tensor[:, i, :] = df_symbol[all_features].to_numpy(dtype=np.float32)
+            # ---------- (4) FLOW — Chaikin Money Flow (N=20) using CLOSE ----------
+            # Using LOW here breaks the indicator (MFM collapses to -1 when High>Low).
+            hl_range = (high - low)
+            mfm = ((close - low) - (high - close)) / (hl_range.replace(0, np.nan) + eps)
+            mfv = mfm.fillna(0.0) * volume
+            vol_sum = volume.rolling(window=w_cmf, min_periods=w_cmf).sum()
+            mfv_sum = mfv.rolling(window=w_cmf, min_periods=w_cmf).sum()
+            flow_cmf = (mfv_sum / (vol_sum + eps)).astype(float)
+
+            # ---------- Align & drop warm-up rows ----------
+            feats = pd.DataFrame({
+                'open':          df_symbol['open'],
+                'high':          df_symbol['high'],
+                'low':           df_symbol['low'],
+                'close':         df_symbol['close'],
+                'trend_ema_dev_low':  trend_ema_dev_low,
+                'momentum_rsi_low':   momentum_rsi_low,
+                'vol_atr_norm_low':   vol_atr_norm_low,
+                'flow_cmf':           flow_cmf
+            }).iloc[discard:]  # length = min_len - discard
+
+            # Final safety: kill any residual NaNs/Infs
+            feats = feats.replace([np.inf, -np.inf], 0.0).fillna(0.0)
+
+            # ---------- Write into tensor ----------
+            tensor[:, i, 0] = feats['open'].to_numpy(dtype=np.float32, copy=False)
+            tensor[:, i, 1] = feats['high'].to_numpy(dtype=np.float32, copy=False)
+            tensor[:, i, 2] = feats['low'].to_numpy(dtype=np.float32, copy=False)
+            tensor[:, i, 3] = feats['close'].to_numpy(dtype=np.float32, copy=False)
+            tensor[:, i, 4] = feats['trend_ema_dev_low'].to_numpy(dtype=np.float32, copy=False)
+            tensor[:, i, 5] = feats['momentum_rsi_low'].to_numpy(dtype=np.float32, copy=False)
+            tensor[:, i, 6] = feats['vol_atr_norm_low'].to_numpy(dtype=np.float32, copy=False)
+            tensor[:, i, 7] = feats['flow_cmf'].to_numpy(dtype=np.float32, copy=False)
 
         return tensor
 
@@ -283,7 +422,7 @@ class CryptoTradingEnv(gym.Env):
             Initial observation (observation at the current step)
         """
         self.start_index = self.current_step # Save the start index for the next episode
-        self.active_crypto_index = None # Reset the active crypto to none
+        # self.active_crypto_index = None # Reset the active crypto to none
         self.buy_price = 0.0 # Reset the buy price to 0
         self.cash_balance = 1.0 # Reset the cash balance to 1
         self.portfolio_value = 1.0 # Reset the portfolio value to 1
@@ -309,9 +448,6 @@ class CryptoTradingEnv(gym.Env):
             full_obs: Current observation (1D vector - Shape [num_cryptos*features_per_crypto + 3])
         """
         # Extract a rolling window of crypto features to allow trend awareness
-        # window_start = self.current_step - self.history_window + 1 # Compute the window start step
-        # window_end = self.current_step + 1 # Compute the window end step
-        # obs_window = self.data[window_start:window_end] # Grab all crypto data at the current timestep - Tensor Shape: [window, cryptos, features] 
         # Determine window boundaries
         window_start = self.current_step - self.history_window + 1
         window_end = self.current_step + 1
@@ -346,7 +482,7 @@ class CryptoTradingEnv(gym.Env):
         else:
             current_profit = 0.0
 
-        current_profit = float(np.clip(current_profit, -10.0, 10.0)) # Clip profit to safe range 
+        current_profit = float(np.clip(current_profit, -10.0, 10.0)) - (0.3/100) # Clip profit to safe range - 0.3% transaction cost
 
         # 3. Held crypto (index or -1 if none) - using one-hot encoding
         held_one_hot = np.zeros(self.num_cryptos + 1, dtype=np.float32)
@@ -412,7 +548,7 @@ class CryptoTradingEnv(gym.Env):
                 else:
                     profit = (final_price - self.buy_price) / self.buy_price
                 self.portfolio_value *= (1 + profit) # Calculate the final portfolio value
-                reward = self._calculate_reward(profit, "SELL") # Calculate the total reward
+                reward = -1.0
 
                 if self.take_logs:
                     # --- ⬇ Add synthetic 'sell' step for timeout ---
@@ -444,15 +580,6 @@ class CryptoTradingEnv(gym.Env):
                     }
                 self._end_episode() # End the episode
 
-        ### NOT BUY ACTION ###
-        # If the action is Not Buy - index = 2 + num_cryptos (special skip option)
-        elif action == (2 + self.num_cryptos):  
-            # End the episode immediately with a small fixed penalty
-            reward = -0.01  # Penalty for skipping the episode
-            self._end_episode() # End the episode
-            done = True   # Episode ends due to Not Buy
-            not_buy_termination = True # Flag for Not Buy termination
-
         ### BUY ACTION ###
         # If the action is Buy - Buy Action range is 1:num_cryptos (for #num_cryptos cryptos)
         elif 1 <= action <= self.num_cryptos:  # Buy crypto[i]
@@ -460,7 +587,7 @@ class CryptoTradingEnv(gym.Env):
                 self.active_crypto_index = action - 1 # Set active crypto index - Adjust index by -1 to match 0-based indexing
                 symbol = self.crypto_codes[self.active_crypto_index] # Grab the symbol we are buying
                 self.buy_price = float(self.raw_lookup[symbol].iloc[self.current_step][BUY_INDEX]) # use raw close price for buy
-                reward = self._calculate_reward(0.0, "BUY", price_series=self._get_price_series())
+                reward = self._calculate_reward(0.0, "BUY")
             else: # If we are already holding a crypto then give a small negative reward - teaches the agent the legal moves
                 reward = -0.1  # Penalty: already holding
         
@@ -474,7 +601,7 @@ class CryptoTradingEnv(gym.Env):
                 if self.buy_price is None or self.buy_price == 0 or np.isnan(self.buy_price): # Calculate the current profit
                     profit = 0  # or np.nan or some fallback strategy
                 else:
-                    profit = (price_now - self.buy_price) / self.buy_price
+                    profit = (price_now - self.buy_price) / self.buy_price - (0.3/100) # 0.3% transaction cost for buy & eventual sell
                 reward = self._calculate_reward(profit, "HOLD") # Calculate the reward at this time step (dense)
 
                 if abs(profit) < 0.001: # If the profit is near 0
@@ -493,7 +620,7 @@ class CryptoTradingEnv(gym.Env):
                 if self.buy_price is None or self.buy_price == 0 or np.isnan(self.buy_price): # Calculate the total profit
                     profit = 0  # or handle however you prefer (e.g., skip trade)
                 else:
-                    profit = (sell_price - self.buy_price) / self.buy_price
+                    profit = (sell_price - self.buy_price) / self.buy_price - (0.3/100) # 0.3% transaction cost for buy & sell
                 self.portfolio_value *= (1 + profit) # Calculate the final portfolio value
                 reward = self._calculate_reward(profit, "SELL") # Calculate the final reward for the episode
                 self._end_episode() # End the episode
@@ -526,7 +653,7 @@ class CryptoTradingEnv(gym.Env):
             if self.active_crypto_index is not None:
                 symbol = self.crypto_codes[self.active_crypto_index] # Grab the active symbol we are holding
                 current_price = float(self.raw_lookup[symbol].iloc[self.current_step][HOLD_INDEX])  # Raw low price
-                log_profit_pct = ((current_price - self.buy_price) / self.buy_price) * 100 if self.buy_price else 0.0
+                log_profit_pct = ((current_price - self.buy_price) / self.buy_price) * 100 - 0.3 if self.buy_price else 0.0
                 if symbol in self.raw_lookup:
                     raw_price = float(self.raw_lookup[symbol].iloc[self.current_step][HOLD_INDEX])  # Raw low price
 
@@ -653,7 +780,7 @@ class CryptoTradingEnv(gym.Env):
         if self.active_crypto_index is None:
             # No crypto currently held → can Buy any symbol or skip the episode (NOT_BUY)
             action_mask[1:self.num_cryptos + 1] = True               # Buy actions
-            action_mask[2 + self.num_cryptos] = True                 # Not Buy (skip)
+            # action_mask[2 + self.num_cryptos] = True                 # Not Buy (skip)
         else:
             # Already holding → only Hold or Sell are valid
             action_mask[0] = True                                    # Hold
@@ -664,6 +791,7 @@ class CryptoTradingEnv(gym.Env):
         self.global_step += 1  # Increment global step AFTER all logic
 
         return obs, reward, terminated, truncated, info # Return the current observation, current/total reward & done flag
+    
 
     def _calculate_reward(self, profit, action, price_series=None):
         """
@@ -680,51 +808,138 @@ class CryptoTradingEnv(gym.Env):
         """
 
         if action == "BUY":
-            reward = 0 # Base reward
-            # --- Volatility-adjusted Sharpe-style penalty ---
-            if price_series is not None and len(price_series) >= 10:
-                returns = price_series.pct_change().fillna(0)
-
-                if returns.std() > 0:
-                    volatility = returns.std()
-                else:
-                    volatility = 1e-6  # avoid div by zero
-
-                # Penalize buys in high-volatility environments
-                reward = -volatility * 0.1  # tune scaling factor
+            is_up, pct_change = self.lookahead_window_summary_buy()
+            if is_up:
+                reward = 0 # Reward scaled by expected rise
+            else:
+                reward = 0 # Penalize expected drops
 
         elif action == "HOLD":
-            # --- Non-linear or Linear reward scaling ---
-            if profit > 0: # If the profit is positive give positive rewards
-                # reward = profit - Linear for mid-trade rewards
-                reward = profit
-            elif profit < 0: # If the profit is negative give negative rewards
-                # reward = -abs(profit) - Linear for mid-trade rewards
-                reward = -abs(profit)
-            else: # If there is no profit (break-even) give negative rewards
-                # Penalize holding a break-even position
-                reward = 0 # Give a zero reward for breaking even
-                # reward = -0.5 * self.break_even_steps # Calculate the reward = -0.5 * break_even_steps (decreases by -5 for every step we continuously break-even)
+            # if profit > 0: # If the profit is positive give positive rewards
+            #     reward = profit # Apply a small penalty for trading costs
+            # elif profit < 0: # If the profit is negative give negative rewards
+            #     reward = -abs(profit)
+            # else: # If there is no profit (break-even) give negative rewards
+            #     reward = 0 # Give a zero reward for breaking even
+            reward = 0 # Neutral base reward for holding
 
         elif action == "SELL":
-            # --- Non-linear or Linear (with factor 100) reward scaling ---
             if profit > 0: # If the profit is positive give positive rewards
-                # reward = profit ** 2 # Calculate the reward = profit ^ 2 - Quadratic scaling to encourage big profits
-                reward = profit * 100 # Factor 100 for encouraging wins
+                reward = profit # Apply a small penalty for trading costs
             elif profit < 0: # If the profit is negative give negative rewards
-                # reward = -abs(profit) ** 2 # Calculate the rewards = -| profit | ^ 2 - Quadratic scaling to discourage big losses
-                reward = -abs(profit) * 100 # Factor 100 for discouraging losses
+                reward = -abs(profit)
             else: # If there is no profit (break-even) give negative rewards
-                # Penalize holding a break-even position
                 reward = 0 # Give a zero reward for breaking even
-                # reward = -0.5 * self.break_even_steps # Calculate the reward = -0.5 * break_even_steps (decreases by -5 for every step we continuously break-even)
 
         # Handle possible Nan Rewards
         if not np.isfinite(reward):
             reward = 0 # Give zero rewards if the value is Nan or infinite
 
         return reward
+    
+    def lookahead_window_summary_not_buy(self) -> Tuple[bool, Dict[str, float]]:
+        """
+        Look ahead for each symbol from step t+1 to t+timeout_steps and compute:
+        - The maximum future value (using BUY_INDEX column).
+        - If it exceeds the current value -> record % increase (positive).
+        - Otherwise -> record % change to the minimum future value (negative or zero).
 
+        Returns:
+        any_will_increase (bool),
+        per_symbol (dict: {symbol -> pct_change})
+        """
+
+        any_will_increase = False
+        per_symbol: Dict[str, float] = {}
+
+        for sym, df in self.raw_lookup.items():
+            n = len(df)
+            if BUY_INDEX not in df.columns or self.global_step < 0 or self.global_step >= n:
+                per_symbol[sym] = 0.0
+                continue
+
+            curr_val = df.loc[self.global_step, BUY_INDEX]
+
+            # Future slice
+            start = min(max(self.global_step + 1, 0), n)
+            end_excl = min(self.global_step + 1 + self.timeout_steps, n)
+
+            if start >= end_excl or not np.isfinite(curr_val):
+                per_symbol[sym] = 0.0
+                continue
+
+            future_vals = df.loc[start:end_excl-1, BUY_INDEX].to_numpy(dtype=float)
+
+            max_future = np.nanmax(future_vals)
+            min_future = np.nanmin(future_vals)
+
+            if max_future > curr_val:
+                pct_change = (max_future / curr_val) - 1.0
+                any_will_increase = True
+            else:
+                pct_change = (min_future / curr_val) - 1.0
+
+            per_symbol[sym] = float(pct_change)
+
+        return any_will_increase, per_symbol
+    
+    def lookahead_window_summary_buy(self) -> Tuple[bool, float]:
+        """
+        For the current crypto only (self.current_crypto), look ahead from
+        self.global_step+1 up to the episode timeout boundary and determine:
+        - If the future max(BUY_INDEX) exceeds the current BUY_INDEX -> will_rise=True and return that max.
+        - Else -> will_rise=False and return the future min(BUY_INDEX).
+
+        Window end is aligned to the episode timeout:
+        remaining_steps = self.timeout_steps - (self.global_step - self.start_step)
+
+        Returns:
+        (will_rise: bool, extreme_value: float | None)
+        """
+        sym = getattr(self, "current_crypto", None)
+        if sym is None or sym not in self.raw_lookup:
+            return False, None
+
+        df = self.raw_lookup[sym]
+        if BUY_INDEX not in df.columns:
+            return False, None
+
+        n = len(df)
+        t = self.global_step
+
+        # bounds
+        if t < 0 or t >= n:
+            return False, None
+
+        curr_val = df.loc[t, BUY_INDEX]
+        if not np.isfinite(curr_val):
+            return False, None
+
+        # remaining steps until episode timeout
+        elapsed = max(0, t - int(self.start_step))
+        remaining_steps = max(0, int(self.timeout_steps) - elapsed)
+
+        # future window [t+1, t+remaining_steps] (end exclusive)
+        start = min(max(t + 1, 0), n)
+        end_excl = min(t + 1 + remaining_steps, n)
+
+        if start >= end_excl:
+            return False, None
+
+        future_vals = df.loc[start:end_excl - 1, BUY_INDEX].to_numpy(dtype=float)
+        if future_vals.size == 0 or not np.isfinite(future_vals).any():
+            return False, None
+
+        max_future = float(np.nanmax(future_vals))
+        min_future = float(np.nanmin(future_vals))
+
+        if np.isfinite(max_future) and (max_future > curr_val):
+            print("lookahead_window_summary_buy says the bought crypto is increasing")
+            return True, max_future
+        else:
+            print("lookahead_window_summary_buy says the bought crypto is decreasing")
+            return False, min_future
+    
     def _end_episode(self):
         """
         Concludes the current episode.
@@ -808,7 +1023,8 @@ class CryptoTradingEnv(gym.Env):
             # No crypto held: enable only buy actions (1 to num_cryptos)
             # Not Buy (skip) action also enabled
             mask[1:self.num_cryptos + 1] = True
-            mask[2 + self.num_cryptos] = True                 
+            # mask[self.active_crypto_index + 1] = False # Disable the buy action for the previously held crypto
+            # mask[2 + self.num_cryptos] = True                 
         else:
             # Crypto held: enable only hold (0) and sell (num_cryptos + 1)
             mask[0] = True
