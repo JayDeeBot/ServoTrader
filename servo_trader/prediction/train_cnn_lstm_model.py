@@ -1,42 +1,44 @@
 #!/usr/bin/env python3
 """
-ServoTrader Prediction Model Training Script (v3.1 - Simplified CNN-LSTM)
+ServoTrader CNN-LSTM Training Script (v3.2 — Pre-Selected Features)
+=====================================================================
 
-Key improvements over v3.0:
-- Simplified architecture (~40K parameters vs 176K)
-- Aggressive Boruta feature selection (reduces to 30-40 features)
-- Better regularization to prevent overfitting
-- Shorter sequence length for more training samples
-- Optuna hyperparameter optimization with TimeSeriesSplit cross-validation
-- Support for on-chain only mode
+Simplified from v3.1. All feature engineering, on-chain fetching,
+sentiment loading, and Boruta selection have been removed. This script
+expects the pre-processed Boruta output CSV (btc_features_selected_tunable.csv)
+where the confirmed features are already present as columns.
 
-Architecture Changes from v3.0 to v3.1:
-- CNN layers: [32, 64] filters (was [64, 128])
-- LSTM layers: [50, 25] units (was [100, 50])
-- Dense layer: [32] units (was [64, 32])
-- Dropout: 0.5 (was 0.3)
-- L2 regularization: 0.01 (was 0.001)
-- Sequence length: 15 (was 30)
-- Target features: 30-40 (was 117)
+Key changes from v3.1:
+  - No feature engineering (no technical indicators, sentiment, on-chain)
+  - No Boruta (features already confirmed — loaded directly from CSV)
+  - Auto-detects the 12 feature columns from the CSV
+  - Default sequence length: 3 days (configurable)
+  - Architecture adapted for small feature count (12 features, seq=3)
+  - All training, Optuna, evaluation, and save logic preserved
+
+Architecture defaults for 12 features / 3-day window:
+  - CNN filters:  [32, 64]
+  - LSTM units:   [50, 25]
+  - Dense units:  [32]
+  - Dropout:      0.5
+  - L2 reg:       0.01
 
 Usage:
-    # Default training (all features)
-    python train_cnn_lstm_v31.py --horizon 1440
-    
-    # ON-CHAIN ONLY MODE - Use only blockchain features
-    python train_cnn_lstm_v31.py --horizon 1440 --onchain-only --optuna
-    
-    # With Optuna hyperparameter optimization
-    python train_cnn_lstm_v31.py --horizon 1440 --optuna --optuna-trials 20
-    
-    # Without Boruta (use all features)
-    python train_cnn_lstm_v31.py --horizon 1440 --no-boruta
-    
-    # Custom feature selection
-    python train_cnn_lstm_v31.py --horizon 1440 --no-technical --no-sentiment
+    # Basic run
+    python train_cnn_lstm_v32.py --data btc_features_selected_tunable.csv
+
+    # With Optuna hyperparameter search (recommended after first baseline)
+    python train_cnn_lstm_v32.py --data btc_features_selected_tunable.csv --optuna --optuna-trials 30
+
+    # Try different context windows
+    python train_cnn_lstm_v32.py --data btc_features_selected_tunable.csv --sequence-length 5
+    python train_cnn_lstm_v32.py --data btc_features_selected_tunable.csv --sequence-length 7
+
+    # CPU only
+    python train_cnn_lstm_v32.py --data btc_features_selected_tunable.csv --cpu
 
 Author: ServoTrader
-Version: 3.1 (Simplified CNN-LSTM with Boruta + Optuna CV)
+Version: 3.2 (CNN-LSTM with Pre-Selected Features)
 """
 
 import os
@@ -45,1732 +47,865 @@ import argparse
 import pickle
 import json
 import yaml
-import shutil
 import warnings
 from datetime import datetime
 from pathlib import Path
-from typing import Tuple, List, Optional, Dict, Any
+from typing import Tuple, List, Dict, Any, Optional
 
-# Parse --cpu flag BEFORE importing TensorFlow
+# ------------------------------------------------------------------
+# --cpu flag must be parsed before TensorFlow is imported
+# ------------------------------------------------------------------
 if '--cpu' in sys.argv:
     os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
-    print("🖥️  CPU-only mode enabled (--cpu flag)")
+    print("CPU-only mode enabled")
 
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import RobustScaler
 from sklearn.metrics import (
     accuracy_score, f1_score, precision_score, recall_score,
-    confusion_matrix, classification_report, roc_auc_score
+    confusion_matrix, roc_auc_score
 )
 from sklearn.utils.class_weight import compute_class_weight
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import TimeSeriesSplit
 
-# Suppress warnings for cleaner output
 warnings.filterwarnings('ignore')
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
-# Early Boruta check (before TensorFlow to catch issues early)
-def check_boruta_installation():
-    """Check if Boruta is properly installed and compatible."""
-    try:
-        from boruta import BorutaPy
-        # Quick compatibility test
-        from sklearn.ensemble import RandomForestClassifier
-        rf = RandomForestClassifier(n_estimators=10, random_state=42)
-        boruta = BorutaPy(rf, n_estimators='auto', max_iter=10, random_state=42)
-        print("✅ Boruta installation verified")
-        return True
-    except ImportError as e:
-        print(f"⚠️  Boruta ImportError: {e}")
-        print("   Try: pip install Boruta")
-        return False
-    except Exception as e:
-        print(f"⚠️  Boruta compatibility issue: {type(e).__name__}: {e}")
-        print("   This may be a numpy/scikit-learn version conflict")
-        return False
 
-BORUTA_PRECHECK = check_boruta_installation()
-
-# Check for Optuna
-def check_optuna_installation():
-    """Check if Optuna is properly installed."""
+# ------------------------------------------------------------------
+# Optional: Optuna
+# ------------------------------------------------------------------
+def _check_optuna() -> bool:
     try:
         import optuna
-        print(f"✅ Optuna {optuna.__version__} available")
+        print(f"Optuna {optuna.__version__} available")
         return True
     except ImportError:
-        print("⚠️  Optuna not installed. Hyperparameter tuning disabled.")
+        print("Optuna not installed - hyperparameter tuning disabled")
         print("   Install with: pip install optuna")
         return False
 
-OPTUNA_AVAILABLE = check_optuna_installation()
-
-# Import optuna if available (for use in objective function)
+OPTUNA_AVAILABLE = _check_optuna()
 if OPTUNA_AVAILABLE:
     import optuna
 
-# Check for on-chain data module
-def check_onchain_module():
-    """Check if on-chain data module is available."""
-    try:
-        from onchain_data import load_onchain_data, OnChainDataFetcher
-        print("✅ On-chain data module found")
-        return True
-    except ImportError:
-        # Try relative import
-        try:
-            import importlib.util
-            import sys
-            # Check same directory as this script
-            script_dir = Path(__file__).parent
-            onchain_path = script_dir / "onchain_data.py"
-            if onchain_path.exists():
-                spec = importlib.util.spec_from_file_location("onchain_data", onchain_path)
-                module = importlib.util.module_from_spec(spec)
-                sys.modules['onchain_data'] = module
-                spec.loader.exec_module(module)
-                print("✅ On-chain data module found (same directory)")
-                return True
-        except Exception:
-            pass
-        print("⚠️  On-chain data module not found (onchain_data.py)")
-        print("   On-chain features will be disabled")
-        return False
 
-ONCHAIN_AVAILABLE = check_onchain_module()
-
-# Import TensorFlow/Keras
+# ------------------------------------------------------------------
+# TensorFlow
+# ------------------------------------------------------------------
 try:
     import tensorflow as tf
     from tensorflow import keras
     from tensorflow.keras import layers, Model, regularizers
     from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
-    TF_AVAILABLE = True
-    KERAS_VERSION = tf.__version__
-    
-    # Configure GPU memory growth
+
     gpus = tf.config.experimental.list_physical_devices('GPU')
     if gpus:
         for gpu in gpus:
             tf.config.experimental.set_memory_growth(gpu, True)
-        print(f"✅ TensorFlow {KERAS_VERSION} with GPU support")
+        print(f"TensorFlow {tf.__version__} - GPU enabled ({len(gpus)} device(s))")
     else:
-        print(f"✅ TensorFlow {KERAS_VERSION} (CPU mode)")
-        
+        print(f"TensorFlow {tf.__version__} - CPU mode")
 except ImportError:
-    TF_AVAILABLE = False
-    print("❌ TensorFlow not installed. Please run: pip install tensorflow")
+    print("TensorFlow not installed.  Run: pip install tensorflow")
     sys.exit(1)
 
 
-# ============================================================
-# Configuration - v3.1 Simplified Defaults
-# ============================================================
+# ==================================================================
+# CONSTANTS & DEFAULTS
+# ==================================================================
 
-# Default paths (update these for your project structure)
 PROJECT_ROOT = Path(__file__).parent
-DATA_DIR = PROJECT_ROOT / "data"
-MODEL_DIR = PROJECT_ROOT / "models" / "prediction"
-DAILY_DATA_DIR = DATA_DIR / "daily_historical"
-SENTIMENT_CACHE_DIR = Path.home() / ".servo_trader" / "sentiment_cache"
+MODEL_DIR    = PROJECT_ROOT / "models" / "prediction"
 
-# v3.1 Simplified Defaults (vs v3.0)
-DEFAULT_HORIZON = 1440             # 1 day in minutes
-DEFAULT_SEQUENCE_LENGTH = 15       # was 30 - shorter for more samples
-DEFAULT_DIRECTION_THRESHOLD = 0.001
-DEFAULT_TRAIN_RATIO = 0.7
-DEFAULT_VAL_RATIO = 0.15
-DEFAULT_EPOCHS = 100
-DEFAULT_BATCH_SIZE = 32
+DEFAULT_SEQUENCE_LENGTH = 1       # 3-day look-back window
+DEFAULT_EPOCHS          = 100
+DEFAULT_BATCH_SIZE      = 32
+DEFAULT_PATIENCE        = 15
+DEFAULT_TRAIN_RATIO     = 0.70
+DEFAULT_VAL_RATIO       = 0.15
+DEFAULT_CNN_FILTERS     = "32,64"
+DEFAULT_LSTM_UNITS      = "50,25"
+DEFAULT_DENSE_UNITS     = "32"
+DEFAULT_DROPOUT         = 0.5
+DEFAULT_L2_REG          = 0.01
+DEFAULT_LR              = 0.001
 
-# v3.1 Simplified Architecture
-DEFAULT_CNN_FILTERS = "32,64"      # was "64,128"
-DEFAULT_LSTM_UNITS = "50,25"       # was "100,50"
-DEFAULT_DENSE_UNITS = "32"         # was "64,32"
-DEFAULT_DROPOUT = 0.5              # was 0.3
-DEFAULT_L2_REG = 0.01              # was 0.001
-DEFAULT_LEARNING_RATE = 0.001
+# Column that holds the binary direction label
+TARGET_COL = "target_next_day_direction"
 
-# Boruta defaults
-DEFAULT_MAX_FEATURES = 40          # Target 30-40 features
-DEFAULT_BORUTA_MAX_ITER = 100
-DEFAULT_BORUTA_PERC = 90
+# Columns that are never input features
+_NON_FEATURE_EXACT   = {"date", "timestamp", "open_time", "close_time", "symbol"}
+_NON_FEATURE_PREFIXES = ("target_",)
 
 
-# ============================================================
-# Boruta Feature Selection
-# ============================================================
+# ==================================================================
+# DATA LOADING
+# ==================================================================
 
-def boruta_feature_selection(
-    X: np.ndarray,
-    y: np.ndarray,
-    feature_names: List[str],
-    max_features: int = 40,
-    max_iter: int = 100,
-    perc: int = 90,
-    verbose: bool = True
-) -> Tuple[np.ndarray, List[str], List[int]]:
-    """
-    Perform aggressive Boruta feature selection.
-    
-    Args:
-        X: Feature matrix (2D: samples x features)
-        y: Target labels
-        feature_names: List of feature names
-        max_features: Maximum features to keep
-        max_iter: Boruta iterations
-        perc: Percentile for shadow feature comparison
-        verbose: Print progress
-        
-    Returns:
-        X_selected: Selected features
-        selected_names: Names of selected features
-        selected_indices: Indices of selected features
-    """
-    print("\n" + "=" * 60)
-    print("🎯 Boruta Feature Selection (Aggressive)")
-    print("=" * 60)
-    print(f"   Input features: {X.shape[1]}")
-    print(f"   Target max features: {max_features}")
-    print(f"   Max iterations: {max_iter}")
-    print(f"   Percentile: {perc}")
-    
-    # Try to import Boruta (use precheck result)
-    BORUTA_AVAILABLE = BORUTA_PRECHECK
-    
-    if BORUTA_AVAILABLE:
-        try:
-            from boruta import BorutaPy
-            print("   ✅ Using Boruta feature selection")
-        except Exception as e:
-            BORUTA_AVAILABLE = False
-            print(f"   ⚠️  Boruta import failed at runtime: {e}")
-    else:
-        print("   ⚠️  Boruta not available. Using Random Forest importance fallback.")
-    
-    if BORUTA_AVAILABLE:
-        try:
-            # Use Random Forest as the estimator
-            rf = RandomForestClassifier(
-                n_estimators=100,
-                max_depth=7,
-                n_jobs=-1,
-                random_state=42,
-                class_weight='balanced'
-            )
-            
-            # Initialize Boruta with aggressive settings
-            boruta = BorutaPy(
-                rf,
-                n_estimators='auto',
-                perc=perc,
-                max_iter=max_iter,
-                random_state=42,
-                verbose=0
-            )
-            
-            # Fit Boruta
-            print("\n   Running Boruta feature selection...")
-            boruta.fit(X, y)
-            
-            # Get confirmed and tentative features
-            confirmed = np.where(boruta.support_)[0]
-            tentative = np.where(boruta.support_weak_)[0]
-            
-            print(f"\n   ✅ Confirmed features: {len(confirmed)}")
-            print(f"   ⚠️  Tentative features: {len(tentative)}")
-            print(f"   ❌ Rejected features: {X.shape[1] - len(confirmed) - len(tentative)}")
-            
-            # Include both confirmed and tentative
-            selected_indices = np.sort(np.concatenate([confirmed, tentative]))
-            
-            # If we have more than max_features, rank by importance and take top N
-            if len(selected_indices) > max_features:
-                print(f"\n   📉 Reducing from {len(selected_indices)} to {max_features} features...")
-                # Fit RF on selected features to get importance ranking
-                X_sel = X[:, selected_indices]
-                rf.fit(X_sel, y)
-                importances = rf.feature_importances_
-                # Get top N by importance
-                top_idx = np.argsort(importances)[-max_features:]
-                selected_indices = selected_indices[top_idx]
-            
-            # If we have fewer than desired, that's fine (Boruta was strict)
-            if len(selected_indices) < 10:
-                print(f"\n   ⚠️  Boruta was very strict ({len(selected_indices)} features).")
-                print("   📈 Falling back to top features by RF importance...")
-                # Fall through to importance-based selection
-                raise ValueError("Too few features selected")
-                
-        except Exception as e:
-            print(f"\n   ⚠️  Boruta failed: {e}")
-            print("   📈 Using Random Forest importance fallback...")
-            BORUTA_AVAILABLE = False
-    
-    if not BORUTA_AVAILABLE:
-        # Fallback: Use Random Forest importance
-        rf = RandomForestClassifier(
-            n_estimators=100,
-            max_depth=7,
-            n_jobs=-1,
-            random_state=42,
-            class_weight='balanced'
-        )
-        rf.fit(X, y)
-        importances = rf.feature_importances_
-        
-        # Select top N features
-        n_select = min(max_features, X.shape[1])
-        selected_indices = np.argsort(importances)[-n_select:]
-        selected_indices = np.sort(selected_indices)
-        print(f"   Selected top {len(selected_indices)} features by importance")
-    
-    # Extract selected features
-    selected_names = [feature_names[i] for i in selected_indices]
-    X_selected = X[:, selected_indices]
-    
-    print(f"\n   📊 Final feature count: {len(selected_names)}")
-    print("\n   Top 10 selected features:")
-    
-    # Show feature importances for selected features
-    rf_final = RandomForestClassifier(n_estimators=50, max_depth=5, random_state=42)
-    rf_final.fit(X_selected, y)
-    final_importances = rf_final.feature_importances_
-    sorted_idx = np.argsort(final_importances)[::-1]
-    
-    for i, idx in enumerate(sorted_idx[:10]):
-        print(f"      {i+1}. {selected_names[idx]}: {final_importances[idx]:.4f}")
-    
-    print("=" * 60 + "\n")
-    
-    return X_selected, selected_names, list(selected_indices)
-
-
-# ============================================================
-# Sentiment Data Functions
-# ============================================================
-
-def fetch_fear_greed_index(use_cache: bool = True, cache_max_age_hours: int = 24) -> pd.DataFrame:
-    """Fetch Fear & Greed Index from Alternative.me API."""
-    cache_file = SENTIMENT_CACHE_DIR / "fear_greed_index.csv"
-    
-    # Check cache
-    if use_cache and cache_file.exists():
-        cache_age = (datetime.now() - datetime.fromtimestamp(cache_file.stat().st_mtime))
-        if cache_age.total_seconds() < cache_max_age_hours * 3600:
-            print(f"   📁 Loading cached sentiment data ({cache_age.seconds // 3600}h old)")
-            return pd.read_csv(cache_file, parse_dates=['timestamp'])
-    
-    print("   🌐 Fetching Fear & Greed Index from API...")
-    
-    try:
-        import requests
-        url = "https://api.alternative.me/fng/?limit=0&format=json"
-        response = requests.get(url, timeout=30)
-        response.raise_for_status()
-        data = response.json()
-        
-        records = []
-        for item in data.get('data', []):
-            records.append({
-                'timestamp': pd.to_datetime(int(item['timestamp']), unit='s'),
-                'fear_greed_value': int(item['value']),
-                'fear_greed_class': item['value_classification']
-            })
-        
-        df = pd.DataFrame(records)
-        df = df.sort_values('timestamp').reset_index(drop=True)
-        
-        # Cache the data
-        SENTIMENT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        df.to_csv(cache_file, index=False)
-        print(f"   ✅ Retrieved {len(df)} days of sentiment data")
-        
-        return df
-        
-    except Exception as e:
-        print(f"   ⚠️  Failed to fetch sentiment data: {e}")
-        if cache_file.exists():
-            print("   📁 Using existing cache as fallback")
-            return pd.read_csv(cache_file, parse_dates=['timestamp'])
-        return pd.DataFrame()
-
-
-def add_sentiment_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Add Fear & Greed sentiment features to dataframe.
-    
-    Note: Fear & Greed Index only available from ~2018. For older dates,
-    values are forward/backward filled from available data.
-    """
-    sentiment_df = fetch_fear_greed_index()
-    
-    if sentiment_df.empty:
-        print("   ⚠️  No sentiment data available, adding neutral defaults...")
-        # Add neutral sentiment for all rows
-        df['fear_greed_value'] = 50.0
-        df['fear_greed_encoded'] = 2  # Neutral
-        df['fear_greed_normalized'] = 0.5
-        df['fear_greed_ma7'] = 0.5
-        df['fear_greed_change'] = 0.0
-        return df
-    
-    # Ensure timestamp is datetime and timezone-naive
-    df['timestamp'] = pd.to_datetime(df['timestamp'])
-    if df['timestamp'].dt.tz is not None:
-        df['timestamp'] = df['timestamp'].dt.tz_localize(None)
-    
-    sentiment_df['timestamp'] = pd.to_datetime(sentiment_df['timestamp'])
-    if sentiment_df['timestamp'].dt.tz is not None:
-        sentiment_df['timestamp'] = sentiment_df['timestamp'].dt.tz_localize(None)
-    
-    # Get date ranges
-    data_start = df['timestamp'].min()
-    data_end = df['timestamp'].max()
-    sentiment_start = sentiment_df['timestamp'].min()
-    sentiment_end = sentiment_df['timestamp'].max()
-    
-    # Create date column for merging
-    df['date'] = df['timestamp'].dt.date
-    sentiment_df['date'] = sentiment_df['timestamp'].dt.date
-    
-    # Merge on date
-    sentiment_cols = ['date', 'fear_greed_value', 'fear_greed_class']
-    df = df.merge(sentiment_df[sentiment_cols], on='date', how='left')
-    
-    # Count direct coverage before filling
-    direct_coverage = df['fear_greed_value'].notna().sum()
-    total_rows = len(df)
-    
-    # Fill missing values (for dates before/after sentiment data available)
-    df['fear_greed_value'] = df['fear_greed_value'].ffill().bfill().fillna(50)
-    
-    # Create numeric encoding for class
-    class_map = {
-        'Extreme Fear': 0, 'Fear': 1, 'Neutral': 2, 'Greed': 3, 'Extreme Greed': 4
-    }
-    df['fear_greed_encoded'] = df['fear_greed_class'].map(class_map).fillna(2)
-    
-    # Normalize fear/greed to 0-1
-    df['fear_greed_normalized'] = df['fear_greed_value'] / 100.0
-    
-    # Calculate sentiment momentum
-    df['fear_greed_ma7'] = df['fear_greed_value'].rolling(7, min_periods=1).mean() / 100.0
-    df['fear_greed_change'] = df['fear_greed_value'].pct_change().fillna(0).clip(-1, 1)
-    
-    # Drop intermediate columns
-    df = df.drop(columns=['date', 'fear_greed_class'], errors='ignore')
-    
-    coverage = direct_coverage / total_rows * 100
-    print(f"   ✅ Sentiment coverage: {coverage:.1f}% direct, 100% after filling")
-    
-    if data_start < sentiment_start:
-        print(f"   ℹ️  Note: Data starts {data_start.strftime('%Y-%m-%d')}, "
-              f"but sentiment only from {sentiment_start.strftime('%Y-%m-%d')}")
-        print(f"   ℹ️  Older dates filled with earliest available sentiment values")
-    
-    return df
-
-
-# ============================================================
-# On-Chain Data Integration
-# ============================================================
-
-def add_onchain_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Add on-chain blockchain metrics to the dataframe.
-    
-    Fetches data from Blockchain.com API (free, no API key required).
-    Includes: hash rate, active addresses, transactions, fees, difficulty, etc.
-    """
-    if not ONCHAIN_AVAILABLE:
-        print("   ⚠️  On-chain module not available, skipping...")
-        return df
-    
-    try:
-        from onchain_data import load_onchain_data
-    except ImportError:
-        print("   ⚠️  Could not import on-chain module, skipping...")
-        return df
-    
-    print("\n🔗 Adding on-chain blockchain features...")
-    
-    # Load on-chain data with derived features
-    onchain_df = load_onchain_data(compute_features=True, use_cache=True)
-    
-    if onchain_df.empty:
-        print("   ⚠️  No on-chain data available, skipping...")
-        return df
-    
-    # Store original row count
-    original_rows = len(df)
-    
-    # Ensure timestamp columns are datetime and timezone-naive
-    df['timestamp'] = pd.to_datetime(df['timestamp'])
-    if df['timestamp'].dt.tz is not None:
-        df['timestamp'] = df['timestamp'].dt.tz_localize(None)
-    
-    onchain_df['date'] = pd.to_datetime(onchain_df['date'])
-    if onchain_df['date'].dt.tz is not None:
-        onchain_df['date'] = onchain_df['date'].dt.tz_localize(None)
-    
-    # Create date column for merging (date only, no time) - ensure timezone-naive
-    df['_merge_date'] = df['timestamp'].dt.normalize()
-    onchain_df['_merge_date'] = onchain_df['date'].dt.normalize()
-    
-    # Remove duplicate dates in on-chain data (keep last value per day)
-    onchain_df = onchain_df.drop_duplicates(subset=['_merge_date'], keep='last')
-    
-    # Get on-chain feature columns (exclude 'date' and '_merge_date')
-    onchain_cols = [c for c in onchain_df.columns if c not in ['date', '_merge_date']]
-    
-    # Merge on normalized date - use LEFT join to preserve original data
-    merge_cols = ['_merge_date'] + onchain_cols
-    df = df.merge(onchain_df[merge_cols], on='_merge_date', how='left')
-    
-    # Verify no row multiplication
-    if len(df) != original_rows:
-        print(f"   ⚠️  Row count changed during merge: {original_rows} -> {len(df)}")
-        print(f"   ⚠️  This indicates duplicate dates in on-chain data. Fixing...")
-        # If rows increased, there were duplicate merge keys - take first occurrence
-        df = df.drop_duplicates(subset=['timestamp'], keep='first')
-        print(f"   ✅ Fixed row count: {len(df)}")
-    
-    # Fill missing values with forward/backward fill
-    for col in onchain_cols:
-        if col in df.columns:
-            df[col] = df[col].ffill().bfill().fillna(0)
-    
-    # Drop the temporary merge column
-    df = df.drop(columns=['_merge_date'], errors='ignore')
-    
-    # Count coverage
-    sample_col = onchain_cols[0] if onchain_cols else None
-    if sample_col and sample_col in df.columns:
-        coverage = df[sample_col].notna().sum() / len(df) * 100
-        print(f"   ✅ On-chain coverage: {coverage:.1f}%")
-        print(f"   📊 Added {len(onchain_cols)} on-chain features")
-        print(f"   📋 Final row count: {len(df)} (unchanged from original)")
-    
-    return df
-
-
-# ============================================================
-# Technical Indicators
-# ============================================================
-
-def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """Add technical indicators to dataframe."""
-    df = df.copy()
-    
-    # Ensure we have the required columns
-    required = ['open', 'high', 'low', 'close', 'volume']
-    for col in required:
-        if col not in df.columns:
-            raise ValueError(f"Missing required column: {col}")
-    
-    # Price-based features
-    df['returns'] = df['close'].pct_change().fillna(0)
-    df['log_returns'] = np.log(df['close'] / df['close'].shift(1)).fillna(0)
-    
-    # Moving averages
-    for period in [5, 10, 20]:
-        df[f'sma_{period}'] = df['close'].rolling(period, min_periods=1).mean()
-        df[f'ema_{period}'] = df['close'].ewm(span=period, adjust=False).mean()
-        df[f'close_to_sma_{period}'] = df['close'] / df[f'sma_{period}']
-    
-    # Volatility
-    df['volatility_5'] = df['returns'].rolling(5, min_periods=1).std()
-    df['volatility_10'] = df['returns'].rolling(10, min_periods=1).std()
-    df['volatility_20'] = df['returns'].rolling(20, min_periods=1).std()
-    
-    # RSI
-    delta = df['close'].diff()
-    gain = delta.where(delta > 0, 0).rolling(14, min_periods=1).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(14, min_periods=1).mean()
-    rs = gain / (loss + 1e-10)
-    df['rsi_14'] = 100 - (100 / (1 + rs))
-    df['rsi_14'] = df['rsi_14'].fillna(50)
-    
-    # MACD
-    ema12 = df['close'].ewm(span=12, adjust=False).mean()
-    ema26 = df['close'].ewm(span=26, adjust=False).mean()
-    df['macd'] = ema12 - ema26
-    df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
-    df['macd_hist'] = df['macd'] - df['macd_signal']
-    
-    # Bollinger Bands
-    df['bb_middle'] = df['close'].rolling(20, min_periods=1).mean()
-    bb_std = df['close'].rolling(20, min_periods=1).std()
-    df['bb_upper'] = df['bb_middle'] + 2 * bb_std
-    df['bb_lower'] = df['bb_middle'] - 2 * bb_std
-    df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / df['bb_middle']
-    df['bb_position'] = (df['close'] - df['bb_lower']) / (df['bb_upper'] - df['bb_lower'] + 1e-10)
-    
-    # ATR
-    high_low = df['high'] - df['low']
-    high_close = abs(df['high'] - df['close'].shift(1))
-    low_close = abs(df['low'] - df['close'].shift(1))
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    df['atr_14'] = tr.rolling(14, min_periods=1).mean()
-    df['atr_normalized'] = df['atr_14'] / df['close']
-    
-    # Volume features
-    df['volume_sma_10'] = df['volume'].rolling(10, min_periods=1).mean()
-    df['volume_ratio'] = df['volume'] / (df['volume_sma_10'] + 1)
-    df['volume_change'] = df['volume'].pct_change().fillna(0).clip(-5, 5)
-    
-    # Price patterns
-    df['high_low_range'] = (df['high'] - df['low']) / df['close']
-    df['close_position'] = (df['close'] - df['low']) / (df['high'] - df['low'] + 1e-10)
-    
-    # Momentum
-    for period in [5, 10, 20]:
-        df[f'momentum_{period}'] = df['close'].pct_change(period).fillna(0)
-    
-    # Fill any remaining NaN
-    df = df.ffill().bfill()
-    
-    return df
-
-
-# ============================================================
-# Data Preparation
-# ============================================================
-
-def create_sequences(X: np.ndarray, y: np.ndarray, seq_length: int) -> Tuple[np.ndarray, np.ndarray]:
-    """Create sequences for LSTM input."""
-    sequences = []
-    labels = []
-    
-    for i in range(len(X) - seq_length):
-        sequences.append(X[i:i + seq_length])
-        labels.append(y[i + seq_length])
-    
-    return np.array(sequences), np.array(labels)
-
-
-def prepare_data(
-    data_path: str,
-    horizon_minutes: int = 1440,
-    sequence_length: int = 15,
-    direction_threshold: float = 0.001,
-    include_technical: bool = True,
-    include_sentiment: bool = True,
-    include_onchain: bool = True,
-    use_boruta: bool = True,
-    max_features: int = 40,
-    train_ratio: float = 0.7,
-    val_ratio: float = 0.15
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray,
-           RobustScaler, List[str], pd.DataFrame, List[int]]:
-    """
-    Prepare data for training with optional Boruta feature selection.
-    
-    Returns:
-        X_train, X_val, X_test: Sequence data (3D: samples, seq_length, features)
-        y_train, y_val, y_test: Labels
-        scaler: Fitted scaler
-        feature_names: List of feature names after selection
-        df: Processed dataframe
-        selected_indices: Indices of selected features (if Boruta used)
-    """
-    print("\n" + "=" * 60)
-    print("📊 Data Preparation (v3.1)")
-    print("=" * 60)
-    
-    # Load data
-    print(f"\n📂 Loading data from: {data_path}")
-    df = pd.read_csv(data_path)
-    print(f"   Rows: {len(df):,}")
-    print(f"   Columns: {list(df.columns)}")
-    
-    # Ensure timestamp
-    if 'timestamp' not in df.columns:
-        if 'date' in df.columns:
-            df['timestamp'] = pd.to_datetime(df['date'])
-        else:
-            df['timestamp'] = pd.date_range(start='2015-01-01', periods=len(df), freq='D')
-    else:
-        df['timestamp'] = pd.to_datetime(df['timestamp'])
-    
-    df = df.sort_values('timestamp').reset_index(drop=True)
-    
-    # Standardize column names
-    col_map = {
-        'Open': 'open', 'High': 'high', 'Low': 'low',
-        'Close': 'close', 'Volume': 'volume', 'VWAP': 'vwap'
-    }
-    df = df.rename(columns=col_map)
-    
-    # Ensure required columns exist
-    required = ['open', 'high', 'low', 'close', 'volume']
-    for col in required:
-        if col not in df.columns:
-            if col == 'volume':
-                df['volume'] = 1000000  # Default volume
-            else:
-                raise ValueError(f"Missing required column: {col}")
-    
-    # Add technical indicators (unless disabled)
-    if include_technical:
-        print("\n🔧 Adding technical indicators...")
-        df = add_technical_indicators(df)
-    else:
-        print("\n⏭️  Skipping technical indicators (disabled)")
-        # Keep only basic OHLCV columns for target calculation
-        # We need 'close' for target creation
-    
-    # Add sentiment features
-    if include_sentiment:
-        print("\n📰 Adding sentiment features...")
-        df = add_sentiment_features(df)
-    else:
-        print("\n⏭️  Skipping sentiment features (disabled)")
-    
-    # Add on-chain features
-    if include_onchain:
-        print("\n🔗 Adding on-chain features...")
-        df = add_onchain_features(df)
-    
-    # Create target variable (direction)
-    print(f"\n🎯 Creating target (horizon={horizon_minutes} min, threshold={direction_threshold})")
-    
-    if horizon_minutes >= 1440:
-        # Daily: use next day's close
-        df['future_return'] = df['close'].pct_change().shift(-1)
-    else:
-        # Intraday: use N-minute return
-        periods = horizon_minutes
-        df['future_return'] = df['close'].pct_change(periods).shift(-periods)
-    
-    # Binary direction: 1 = up, 0 = down
-    df['direction'] = (df['future_return'] > direction_threshold).astype(int)
-    
-    # Remove rows with NaN target
-    df = df.dropna(subset=['direction', 'future_return'])
-    
-    up_pct = df['direction'].mean() * 100
-    print(f"   Class balance: Up={up_pct:.1f}%, Down={100-up_pct:.1f}%")
-    
-    # Sanity check: Bitcoin typically has 45-55% up days
-    if up_pct < 10 or up_pct > 90:
-        print(f"\n   ⚠️  WARNING: Class balance looks wrong!")
-        print(f"   ⚠️  Expected ~45-55% up days, got {up_pct:.1f}%")
-        print(f"   ⚠️  This may indicate a data processing error.")
-        print(f"   ⚠️  Checking data integrity...")
-        
-        # Debug: Show sample of returns
-        print(f"\n   📊 Debug - Future return stats:")
-        print(f"      Mean: {df['future_return'].mean()*100:.4f}%")
-        print(f"      Std: {df['future_return'].std()*100:.4f}%")
-        print(f"      Min: {df['future_return'].min()*100:.4f}%")
-        print(f"      Max: {df['future_return'].max()*100:.4f}%")
-        print(f"      Sample values: {df['future_return'].head(10).tolist()}")
-    
-    # Select feature columns (exclude metadata and target)
-    exclude_cols = ['timestamp', 'date', 'direction', 'future_return', 'symbol']
-    feature_cols = [c for c in df.columns if c not in exclude_cols and df[c].dtype in ['float64', 'int64', 'float32', 'int32']]
-    
-    print(f"\n📋 Initial features: {len(feature_cols)}")
-    
-    # Prepare feature matrix
-    X_raw = df[feature_cols].values
-    y_raw = df['direction'].values
-    
-    # Temporal train/val/test split
-    n_samples = len(X_raw)
-    train_end = int(n_samples * train_ratio)
-    val_end = int(n_samples * (train_ratio + val_ratio))
-    
-    X_train_raw = X_raw[:train_end]
-    y_train_raw = y_raw[:train_end]
-    X_val_raw = X_raw[train_end:val_end]
-    y_val_raw = y_raw[train_end:val_end]
-    X_test_raw = X_raw[val_end:]
-    y_test_raw = y_raw[val_end:]
-    
-    print(f"\n✂️  Temporal split (before sequences):")
-    print(f"   Train: {len(X_train_raw):,} | Val: {len(X_val_raw):,} | Test: {len(X_test_raw):,}")
-    
-    # Apply Boruta feature selection on training data
-    selected_indices = list(range(len(feature_cols)))  # Default: all features
-    
-    if use_boruta:
-        X_train_selected, selected_names, selected_indices = boruta_feature_selection(
-            X_train_raw, y_train_raw, feature_cols,
-            max_features=max_features,
-            max_iter=DEFAULT_BORUTA_MAX_ITER,
-            perc=DEFAULT_BORUTA_PERC
-        )
-        feature_cols = selected_names
-        
-        # Apply same selection to val and test
-        X_val_selected = X_val_raw[:, selected_indices]
-        X_test_selected = X_test_raw[:, selected_indices]
-    else:
-        X_train_selected = X_train_raw
-        X_val_selected = X_val_raw
-        X_test_selected = X_test_raw
-        print(f"\n⏭️  Skipping Boruta (using all {len(feature_cols)} features)")
-    
-    # Scale features
-    print("\n📏 Scaling features with RobustScaler...")
-    scaler = RobustScaler()
-    X_train_scaled = scaler.fit_transform(X_train_selected)
-    X_val_scaled = scaler.transform(X_val_selected)
-    X_test_scaled = scaler.transform(X_test_selected)
-    
-    # Create sequences
-    print(f"\n🔄 Creating sequences (length={sequence_length})...")
-    X_train, y_train = create_sequences(X_train_scaled, y_train_raw, sequence_length)
-    X_val, y_val = create_sequences(X_val_scaled, y_val_raw, sequence_length)
-    X_test, y_test = create_sequences(X_test_scaled, y_test_raw, sequence_length)
-    
-    print(f"   Train: {X_train.shape} | Val: {X_val.shape} | Test: {X_test.shape}")
-    
-    train_up = y_train.sum()
-    train_down = len(y_train) - train_up
-    print(f"   Training class balance: Down={train_down} ({train_down/len(y_train)*100:.1f}%), "
-          f"Up={train_up} ({train_up/len(y_train)*100:.1f}%)")
-    
-    print("\n" + "=" * 60)
-    print("✅ Data Preparation Complete")
-    print("=" * 60)
-    
-    return (X_train, X_val, X_test, y_train, y_val, y_test,
-            scaler, feature_cols, df, selected_indices)
-
-
-# ============================================================
-# CNN-LSTM Model Architecture (v3.1 Simplified)
-# ============================================================
-
-def build_cnn_lstm_model_v31(
+def load_preselected_data(
+    csv_path:        str,
     sequence_length: int,
-    n_features: int,
-    cnn_filters: List[int] = [32, 64],
-    lstm_units: List[int] = [50, 25],
-    dense_units: List[int] = [32],
-    dropout_rate: float = 0.5,
-    l2_reg: float = 0.01,
-    learning_rate: float = 0.001
+    train_ratio:     float,
+    val_ratio:       float,
+) -> Tuple[
+    np.ndarray, np.ndarray, np.ndarray,   # X_train, X_val, X_test
+    np.ndarray, np.ndarray, np.ndarray,   # y_train, y_val, y_test
+    RobustScaler,
+    List[str],                             # feature_names
+]:
+    """
+    Load the Boruta-selected features CSV and return scaled sequence arrays.
+
+    Steps:
+      1. Read CSV and sort chronologically
+      2. Auto-detect feature columns (numeric, not date, not target_*)
+      3. Temporal 70/15/15 train/val/test split
+      4. RobustScaler fitted on train only
+      5. Build sliding-window sequences of `sequence_length` days
+    """
+    print("\n" + "=" * 60)
+    print("  Loading Pre-Selected Feature Data (v3.2)")
+    print("=" * 60)
+
+    csv_path = Path(csv_path)
+    if not csv_path.exists():
+        raise FileNotFoundError(f"Data file not found: {csv_path}")
+
+    df = pd.read_csv(csv_path)
+    print(f"\n  File:    {csv_path.name}")
+    print(f"  Rows:    {len(df):,}")
+    print(f"  Columns: {df.shape[1]}")
+
+    # Sort chronologically
+    date_col = None
+    for c in df.columns:
+        if c.lower() in ("date", "timestamp", "open_time"):
+            date_col = c
+            break
+    if date_col:
+        df[date_col] = pd.to_datetime(df[date_col])
+        df = df.sort_values(date_col).reset_index(drop=True)
+        print(f"  Range:   {df[date_col].min().date()} -> {df[date_col].max().date()}")
+    else:
+        print("  WARNING: No date column found - assuming rows are in chronological order")
+
+    # Identify feature columns
+    feature_cols = []
+    for col in df.columns:
+        if col.lower() in _NON_FEATURE_EXACT:
+            continue
+        if any(col.startswith(p) for p in _NON_FEATURE_PREFIXES):
+            continue
+        if df[col].dtype not in (np.float64, np.float32, np.int64, np.int32, float, int):
+            continue
+        feature_cols.append(col)
+
+    print(f"\n  Features detected ({len(feature_cols)}):")
+    for fc in feature_cols:
+        print(f"    - {fc}")
+
+    if TARGET_COL not in df.columns:
+        available_targets = [c for c in df.columns if c.startswith("target_")]
+        raise ValueError(
+            f"Target column '{TARGET_COL}' not found.\n"
+            f"Available target columns: {available_targets}"
+        )
+
+    # Drop rows with NaN in features or target
+    cols_needed = feature_cols + [TARGET_COL]
+    before = len(df)
+    df = df.dropna(subset=cols_needed).reset_index(drop=True)
+    if len(df) < before:
+        print(f"\n  WARNING: Dropped {before - len(df)} rows with NaN values")
+
+    X_raw = df[feature_cols].values.astype(np.float32)
+    y_raw = df[TARGET_COL].values.astype(np.int32)
+
+    # Class balance check
+    up_pct = y_raw.mean() * 100
+    print(f"\n  Class balance:  UP={up_pct:.1f}%  DOWN={100 - up_pct:.1f}%")
+    if up_pct < 25 or up_pct > 75:
+        print(f"  WARNING: Unusual class balance - check target column")
+
+    # Temporal split
+    n         = len(X_raw)
+    train_end = int(n * train_ratio)
+    val_end   = int(n * (train_ratio + val_ratio))
+
+    X_tr_raw = X_raw[:train_end];        y_tr_raw = y_raw[:train_end]
+    X_va_raw = X_raw[train_end:val_end]; y_va_raw = y_raw[train_end:val_end]
+    X_te_raw = X_raw[val_end:];          y_te_raw = y_raw[val_end:]
+
+    print(f"\n  Temporal split (before sequences):")
+    print(f"    Train: {len(X_tr_raw):,}  |  Val: {len(X_va_raw):,}  |  Test: {len(X_te_raw):,}")
+
+    # Scale (fit on train only)
+    scaler   = RobustScaler()
+    X_tr_sc  = scaler.fit_transform(X_tr_raw)
+    X_va_sc  = scaler.transform(X_va_raw)
+    X_te_sc  = scaler.transform(X_te_raw)
+
+    # Build sliding-window sequences
+    def make_sequences(X: np.ndarray, y: np.ndarray, seq_len: int):
+        xs, ys = [], []
+        for i in range(len(X) - seq_len):
+            xs.append(X[i:i + seq_len])
+            ys.append(y[i + seq_len])
+        return np.array(xs, dtype=np.float32), np.array(ys, dtype=np.int32)
+
+    print(f"\n  Building {sequence_length}-step sequences...")
+    X_train, y_train = make_sequences(X_tr_sc, y_tr_raw, sequence_length)
+    X_val,   y_val   = make_sequences(X_va_sc, y_va_raw, sequence_length)
+    X_test,  y_test  = make_sequences(X_te_sc, y_te_raw, sequence_length)
+
+    print(f"    Train: {X_train.shape}  |  Val: {X_val.shape}  |  Test: {X_test.shape}")
+
+    # Param/sample ratio warning (rough estimate with default arch)
+    rough_params = (32 * 3 * len(feature_cols) +
+                    50 * 4 * (len(feature_cols) + 50) + 32 * 50 + 32)
+    ratio = rough_params / max(len(X_train), 1)
+    ratio_flag = "WARNING" if ratio > 10 else "OK"
+    print(f"    Param/sample ratio: ~{ratio:.1f}:1  [{ratio_flag} - target < 10:1]")
+
+    print("\n" + "=" * 60)
+    print("  Data loading complete")
+    print("=" * 60)
+
+    return X_train, X_val, X_test, y_train, y_val, y_test, scaler, feature_cols
+
+
+# ==================================================================
+# MODEL ARCHITECTURE
+# ==================================================================
+
+def build_cnn_lstm(
+    sequence_length: int,
+    n_features:      int,
+    cnn_filters:     List[int] = [32, 64],
+    lstm_units:      List[int] = [50, 25],
+    dense_units:     List[int] = [32],
+    dropout_rate:    float     = 0.5,
+    l2_reg:          float     = 0.01,
+    learning_rate:   float     = 0.001,
 ) -> Model:
     """
-    Build simplified CNN-LSTM model for v3.1.
-    
-    Target: ~40K parameters (vs 176K in v3.0)
+    CNN-LSTM classifier for binary direction prediction.
+
+    CNN layers extract local patterns across time steps.
+    LSTM layers model sequential dependencies across those patterns.
+    MaxPooling is only applied when the remaining sequence is long
+    enough to avoid collapsing it to zero steps.
     """
     print("\n" + "=" * 60)
-    print("🏗️  Building CNN-LSTM Model (v3.1 Simplified)")
+    print("  Building CNN-LSTM (v3.2)")
     print("=" * 60)
-    print(f"   Sequence length: {sequence_length}")
-    print(f"   Features: {n_features}")
-    print(f"   CNN filters: {cnn_filters}")
-    print(f"   LSTM units: {lstm_units}")
-    print(f"   Dense units: {dense_units}")
-    print(f"   Dropout: {dropout_rate}")
-    print(f"   L2 reg: {l2_reg}")
-    
-    # Input layer
-    inputs = layers.Input(shape=(sequence_length, n_features), name='input')
-    x = inputs
-    
+    print(f"  Input shape:  ({sequence_length}, {n_features})")
+    print(f"  CNN filters:  {cnn_filters}")
+    print(f"  LSTM units:   {lstm_units}")
+    print(f"  Dense units:  {dense_units}")
+    print(f"  Dropout:      {dropout_rate}")
+    print(f"  L2 reg:       {l2_reg}")
+    print(f"  LR:           {learning_rate}")
+
+    inp         = layers.Input(shape=(sequence_length, n_features), name="input")
+    x           = inp
+    current_len = sequence_length
+
     # CNN layers
     for i, filters in enumerate(cnn_filters):
         x = layers.Conv1D(
-            filters=filters,
-            kernel_size=3,
-            padding='same',
-            kernel_regularizer=regularizers.l2(l2_reg),
-            name=f'conv1d_{i+1}'
+            filters     = filters,
+            kernel_size = min(3, current_len),
+            padding     = "same",
+            kernel_regularizer = regularizers.l2(l2_reg),
+            name        = f"conv_{i+1}",
         )(x)
-        x = layers.BatchNormalization(name=f'bn_cnn_{i+1}')(x)
-        x = layers.ReLU(name=f'relu_cnn_{i+1}')(x)
-        x = layers.Dropout(dropout_rate, name=f'dropout_cnn_{i+1}')(x)
-        
-        # Max pooling (only if sequence is long enough)
-        if x.shape[1] > 2:
-            x = layers.MaxPooling1D(pool_size=2, name=f'maxpool_{i+1}')(x)
-    
+        x = layers.BatchNormalization(name=f"bn_conv_{i+1}")(x)
+        x = layers.ReLU(name=f"relu_conv_{i+1}")(x)
+        x = layers.Dropout(dropout_rate, name=f"drop_conv_{i+1}")(x)
+
+        # Only pool if sequence is long enough to survive it
+        if current_len > 2:
+            x           = layers.MaxPooling1D(pool_size=2, name=f"pool_{i+1}")(x)
+            current_len = current_len // 2
+
     # LSTM layers
     for i, units in enumerate(lstm_units):
-        return_sequences = i < len(lstm_units) - 1
+        return_seq = (i < len(lstm_units) - 1)
         x = layers.LSTM(
-            units=units,
-            return_sequences=return_sequences,
-            kernel_regularizer=regularizers.l2(l2_reg),
-            recurrent_regularizer=regularizers.l2(l2_reg),
-            name=f'lstm_{i+1}'
+            units,
+            return_sequences      = return_seq,
+            kernel_regularizer    = regularizers.l2(l2_reg),
+            recurrent_regularizer = regularizers.l2(l2_reg),
+            name                  = f"lstm_{i+1}",
         )(x)
-        x = layers.Dropout(dropout_rate, name=f'dropout_lstm_{i+1}')(x)
-    
-    # Dense layers
+        x = layers.Dropout(dropout_rate, name=f"drop_lstm_{i+1}")(x)
+
+    # Dense head
     for i, units in enumerate(dense_units):
         x = layers.Dense(
             units,
-            kernel_regularizer=regularizers.l2(l2_reg),
-            name=f'dense_{i+1}'
+            kernel_regularizer = regularizers.l2(l2_reg),
+            name               = f"dense_{i+1}",
         )(x)
-        x = layers.BatchNormalization(name=f'bn_dense_{i+1}')(x)
-        x = layers.ReLU(name=f'relu_dense_{i+1}')(x)
-        x = layers.Dropout(dropout_rate, name=f'dropout_dense_{i+1}')(x)
-    
-    # Output layer
-    outputs = layers.Dense(1, activation='sigmoid', name='output')(x)
-    
-    # Build model
-    model = Model(inputs=inputs, outputs=outputs, name='cnn_lstm_v31')
-    
-    # Compile
-    optimizer = keras.optimizers.Adam(learning_rate=learning_rate)
+        x = layers.BatchNormalization(name=f"bn_dense_{i+1}")(x)
+        x = layers.ReLU(name=f"relu_dense_{i+1}")(x)
+        x = layers.Dropout(dropout_rate, name=f"drop_dense_{i+1}")(x)
+
+    out = layers.Dense(1, activation="sigmoid", name="output")(x)
+
+    model = Model(inputs=inp, outputs=out, name="cnn_lstm_v32")
     model.compile(
-        optimizer=optimizer,
-        loss='binary_crossentropy',
-        metrics=['accuracy']
+        optimizer = keras.optimizers.Adam(learning_rate=learning_rate),
+        loss      = "binary_crossentropy",
+        metrics   = ["accuracy"],
     )
-    
-    # Print summary
+
     total_params = model.count_params()
-    print(f"\n   Total parameters: {total_params:,}")
-    print(f"   Target was: ~40,000")
-    
-    if total_params > 50000:
-        print(f"   ⚠️  Model has more parameters than target!")
-    else:
-        print(f"   ✅ Model within target parameter budget")
-    
+    print(f"\n  Total parameters: {total_params:,}")
     print("=" * 60 + "\n")
-    
+
     return model
 
 
-# ============================================================
-# Training
-# ============================================================
+# ==================================================================
+# TRAINING
+# ==================================================================
 
 def train_model(
-    model: Model,
-    X_train: np.ndarray,
-    y_train: np.ndarray,
-    X_val: np.ndarray,
-    y_val: np.ndarray,
-    epochs: int = 100,
-    batch_size: int = 32,
-    patience: int = 15,
-    output_dir: Path = None
+    model:      Model,
+    X_train:    np.ndarray,
+    y_train:    np.ndarray,
+    X_val:      np.ndarray,
+    y_val:      np.ndarray,
+    epochs:     int            = 100,
+    batch_size: int            = 32,
+    patience:   int            = 15,
+    output_dir: Optional[Path] = None,
 ) -> Tuple[Model, Dict]:
-    """Train the model with early stopping."""
+    """Train with early stopping, LR reduction, and optional checkpoint."""
     print("\n" + "=" * 60)
-    print("🚀 Training Model")
+    print("  Training")
     print("=" * 60)
-    print(f"   Epochs: {epochs}")
-    print(f"   Batch size: {batch_size}")
-    print(f"   Early stopping patience: {patience}")
-    
-    # Class weights for imbalanced data
-    class_weights = compute_class_weight(
-        'balanced',
-        classes=np.unique(y_train),
-        y=y_train
-    )
-    class_weight_dict = {i: w for i, w in enumerate(class_weights)}
-    print(f"   Class weights: {class_weight_dict}")
-    
-    # Callbacks
+    print(f"  Epochs:      {epochs}")
+    print(f"  Batch size:  {batch_size}")
+    print(f"  ES patience: {patience}")
+
+    cw  = compute_class_weight("balanced", classes=np.unique(y_train), y=y_train)
+    cwd = dict(enumerate(cw))
+    print(f"  Class weights: {cwd}")
+
     callbacks = [
         EarlyStopping(
-            monitor='val_accuracy',
-            patience=patience,
-            restore_best_weights=True,
-            verbose=1,
-            mode='max'
+            monitor              = "val_accuracy",
+            patience             = patience,
+            restore_best_weights = True,
+            mode                 = "max",
+            verbose              = 1,
         ),
         ReduceLROnPlateau(
-            monitor='val_loss',
-            factor=0.5,
-            patience=7,
-            min_lr=1e-6,
-            verbose=1
-        )
+            monitor  = "val_loss",
+            factor   = 0.5,
+            patience = max(patience // 2, 5),
+            min_lr   = 1e-6,
+            verbose  = 1,
+        ),
     ]
-    
-    # Add checkpoint if output_dir specified
+
     if output_dir:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         callbacks.append(
             ModelCheckpoint(
-                filepath=str(output_dir / 'cnn_lstm_v31_best.keras'),
-                monitor='val_accuracy',
-                save_best_only=True,
-                mode='max',
-                verbose=1
+                filepath       = str(output_dir / "cnn_lstm_v32_best.keras"),
+                monitor        = "val_accuracy",
+                save_best_only = True,
+                mode           = "max",
+                verbose        = 1,
             )
         )
-    
-    print("\n" + "-" * 60)
-    
-    # Train
+
+    print()
     history = model.fit(
         X_train, y_train,
-        validation_data=(X_val, y_val),
-        epochs=epochs,
-        batch_size=batch_size,
-        class_weight=class_weight_dict,
-        callbacks=callbacks,
-        verbose=1
+        validation_data = (X_val, y_val),
+        epochs          = epochs,
+        batch_size      = batch_size,
+        class_weight    = cwd,
+        callbacks       = callbacks,
+        verbose         = 1,
     )
-    
-    # Convert history to dict
-    history_dict = {
-        'loss': [float(x) for x in history.history['loss']],
-        'accuracy': [float(x) for x in history.history['accuracy']],
-        'val_loss': [float(x) for x in history.history['val_loss']],
-        'val_accuracy': [float(x) for x in history.history['val_accuracy']]
-    }
-    
+
+    history_dict = {k: [float(v) for v in vals]
+                    for k, vals in history.history.items()}
+
+    best_epoch = int(np.argmax(history_dict["val_accuracy"])) + 1
+    best_val   = max(history_dict["val_accuracy"])
+    print(f"\n  Best epoch: {best_epoch}  val_accuracy = {best_val*100:.2f}%")
     print("\n" + "=" * 60)
-    print("✅ Training Complete")
+    print("  Training complete")
     print("=" * 60)
-    
+
     return model, history_dict
 
 
-# ============================================================
-# Evaluation
-# ============================================================
+# ==================================================================
+# EVALUATION
+# ==================================================================
 
 def evaluate_model(
-    model: Model,
+    model:  Model,
     X_test: np.ndarray,
-    y_test: np.ndarray
+    y_test: np.ndarray,
 ) -> Dict[str, float]:
-    """Evaluate model on test set."""
+    """Full evaluation on held-out test set."""
     print("\n" + "=" * 60)
-    print("📊 Model Evaluation")
+    print("  Evaluation")
     print("=" * 60)
-    
-    # Predictions
-    y_proba = model.predict(X_test, verbose=0).flatten()
-    y_pred = (y_proba > 0.5).astype(int)
-    
-    # Metrics
-    accuracy = accuracy_score(y_test, y_pred)
-    f1 = f1_score(y_test, y_pred, zero_division=0)
+
+    y_prob = model.predict(X_test, verbose=0).flatten()
+    y_pred = (y_prob >= 0.5).astype(int)
+
+    acc       = accuracy_score(y_test, y_pred)
+    f1        = f1_score(y_test, y_pred, zero_division=0)
     precision = precision_score(y_test, y_pred, zero_division=0)
-    recall = recall_score(y_test, y_pred, zero_division=0)
-    
+    recall    = recall_score(y_test, y_pred, zero_division=0)
+
     try:
-        auc_roc = roc_auc_score(y_test, y_proba)
-    except:
-        auc_roc = 0.5
-    
-    # Per-class accuracy
+        auc = roc_auc_score(y_test, y_prob)
+    except Exception:
+        auc = 0.5
+
     cm = confusion_matrix(y_test, y_pred)
     if cm.shape == (2, 2):
-        down_correct = cm[0, 0]
-        down_total = cm[0, :].sum()
-        up_correct = cm[1, 1]
-        up_total = cm[1, :].sum()
-        down_acc = down_correct / max(down_total, 1)
-        up_acc = up_correct / max(up_total, 1)
+        tn, fp, fn, tp = cm.ravel()
+        down_acc = tn / max(tn + fp, 1)
+        up_acc   = tp / max(tp + fn, 1)
     else:
+        tn = fp = fn = tp = 0
         down_acc = up_acc = 0.5
-    
-    metrics = {
-        'accuracy': float(accuracy),
-        'f1': float(f1),
-        'precision': float(precision),
-        'recall': float(recall),
-        'auc_roc': float(auc_roc),
-        'down_accuracy': float(down_acc),
-        'up_accuracy': float(up_acc)
-    }
-    
-    print(f"\n   Test Accuracy: {accuracy*100:.2f}%")
-    print(f"   F1 Score: {f1:.4f}")
-    print(f"   Precision: {precision:.4f}")
-    print(f"   Recall: {recall:.4f}")
-    print(f"   AUC-ROC: {auc_roc:.4f}")
-    print(f"\n   Down Accuracy: {down_acc*100:.2f}% ({down_correct}/{down_total})")
-    print(f"   Up Accuracy: {up_acc*100:.2f}% ({up_correct}/{up_total})")
-    
-    print("\n   Confusion Matrix:")
-    print(f"              Pred Down  Pred Up")
-    print(f"   Actual Down    {cm[0,0]:5d}    {cm[0,1]:5d}")
-    print(f"   Actual Up      {cm[1,0]:5d}    {cm[1,1]:5d}")
-    
+
+    print(f"\n  Accuracy:   {acc*100:.2f}%")
+    print(f"  F1 score:   {f1:.4f}")
+    print(f"  Precision:  {precision:.4f}")
+    print(f"  Recall:     {recall:.4f}")
+    print(f"  AUC-ROC:    {auc:.4f}")
+    print(f"\n  Per-class accuracy:")
+    print(f"    DOWN  {down_acc*100:.1f}%  ({tn} correct / {tn+fp} total)")
+    print(f"    UP    {up_acc*100:.1f}%  ({tp} correct / {tp+fn} total)")
+    print(f"\n  Confusion matrix:")
+    print(f"               Pred DOWN   Pred UP")
+    print(f"  Actual DOWN  {tn:9d}  {fp:8d}")
+    print(f"  Actual UP    {fn:9d}  {tp:8d}")
     print("=" * 60 + "\n")
-    
-    return metrics
+
+    return {
+        "accuracy":      float(acc),
+        "f1":            float(f1),
+        "precision":     float(precision),
+        "recall":        float(recall),
+        "auc_roc":       float(auc),
+        "down_accuracy": float(down_acc),
+        "up_accuracy":   float(up_acc),
+        "tn": int(tn), "fp": int(fp),
+        "fn": int(fn), "tp": int(tp),
+    }
 
 
-# ============================================================
-# Optuna Hyperparameter Optimization
-# ============================================================
+# ==================================================================
+# OPTUNA HYPERPARAMETER OPTIMISATION
+# ==================================================================
 
-def create_optuna_objective(
-    X_train: np.ndarray,
-    y_train: np.ndarray,
-    X_val: np.ndarray,
-    y_val: np.ndarray,
-    n_features: int,
-    sequence_length: int,
-    n_cv_folds: int = 3
+def _build_optuna_objective(
+    X_train:     np.ndarray,
+    y_train:     np.ndarray,
+    X_val:       np.ndarray,
+    y_val:       np.ndarray,
+    n_features:  int,
+    seq_len:     int,
+    n_cv_folds:  int,
 ):
     """
-    Create an Optuna objective function with TimeSeriesSplit cross-validation.
-    
-    Uses k-fold cross-validation to get more robust hyperparameter evaluation
-    and reduce overfitting to a single validation set.
-    
-    Args:
-        X_train, y_train: Training data
-        X_val, y_val: Validation data (combined with train for CV)
-        n_features: Number of features
-        sequence_length: Sequence length
-        n_cv_folds: Number of cross-validation folds
-        
-    Returns:
-        Objective function for Optuna
+    Returns an Optuna objective evaluated via TimeSeriesSplit CV
+    over the combined train+val set — avoids overfitting to a single
+    validation split.
     """
-    from sklearn.model_selection import TimeSeriesSplit
-    
-    # Combine train and val for cross-validation
-    X_combined = np.concatenate([X_train, X_val], axis=0)
-    y_combined = np.concatenate([y_train, y_val], axis=0)
-    
-    # Create TimeSeriesSplit (respects temporal ordering)
-    tscv = TimeSeriesSplit(n_splits=n_cv_folds)
-    
+    X_all = np.concatenate([X_train, X_val], axis=0)
+    y_all = np.concatenate([y_train, y_val], axis=0)
+    tscv  = TimeSeriesSplit(n_splits=n_cv_folds)
+
     def objective(trial):
-        # Clear TensorFlow session to prevent memory issues
         tf.keras.backend.clear_session()
-        
-        # Suggest hyperparameters
-        # CNN architecture
-        n_cnn_layers = trial.suggest_int('n_cnn_layers', 1, 3)
-        cnn_filters = []
-        for i in range(n_cnn_layers):
-            filters = trial.suggest_categorical(f'cnn_filters_{i}', [16, 32, 64, 128])
-            cnn_filters.append(filters)
-        
-        # LSTM architecture
-        n_lstm_layers = trial.suggest_int('n_lstm_layers', 1, 2)
-        lstm_units = []
-        for i in range(n_lstm_layers):
-            units = trial.suggest_categorical(f'lstm_units_{i}', [25, 50, 75, 100])
-            lstm_units.append(units)
-        
-        # Dense layers
-        n_dense_layers = trial.suggest_int('n_dense_layers', 1, 2)
-        dense_units = []
-        for i in range(n_dense_layers):
-            units = trial.suggest_categorical(f'dense_units_{i}', [16, 32, 64])
-            dense_units.append(units)
-        
-        # Regularization
-        dropout_rate = trial.suggest_float('dropout', 0.2, 0.6, step=0.1)
-        l2_reg = trial.suggest_float('l2_reg', 1e-4, 1e-1, log=True)
-        
-        # Training parameters
-        learning_rate = trial.suggest_float('learning_rate', 1e-4, 1e-2, log=True)
-        batch_size = trial.suggest_categorical('batch_size', [16, 32, 64])
-        
-        # Cross-validation scores
+
+        n_cnn  = trial.suggest_int("n_cnn_layers", 1, 2)
+        cnn_f  = [trial.suggest_categorical(f"cnn_f_{i}", [16, 32, 64])
+                  for i in range(n_cnn)]
+
+        n_lstm = trial.suggest_int("n_lstm_layers", 1, 2)
+        lstm_u = [trial.suggest_categorical(f"lstm_u_{i}", [25, 50, 75])
+                  for i in range(n_lstm)]
+
+        n_dense = trial.suggest_int("n_dense_layers", 1, 2)
+        dense_u = [trial.suggest_categorical(f"dense_u_{i}", [16, 32, 64])
+                   for i in range(n_dense)]
+
+        dropout    = trial.suggest_float("dropout",    0.2, 0.6, step=0.1)
+        l2_reg     = trial.suggest_float("l2_reg",     1e-4, 0.1, log=True)
+        lr         = trial.suggest_float("lr",         1e-4, 1e-2, log=True)
+        batch_size = trial.suggest_categorical("batch_size", [16, 32, 64])
+
         cv_scores = []
-        
-        for fold_idx, (train_idx, val_idx) in enumerate(tscv.split(X_combined)):
-            X_cv_train, X_cv_val = X_combined[train_idx], X_combined[val_idx]
-            y_cv_train, y_cv_val = y_combined[train_idx], y_combined[val_idx]
-            
-            # Build model with suggested parameters
-            model = build_cnn_lstm_model_v31(
-                sequence_length=sequence_length,
-                n_features=n_features,
-                cnn_filters=cnn_filters,
-                lstm_units=lstm_units,
-                dense_units=dense_units,
-                dropout_rate=dropout_rate,
-                l2_reg=l2_reg,
-                learning_rate=learning_rate
-            )
-            
-            # Class weights
-            class_weights = compute_class_weight(
-                'balanced',
-                classes=np.unique(y_cv_train),
-                y=y_cv_train
-            )
-            class_weight_dict = {i: w for i, w in enumerate(class_weights)}
-            
-            # Callbacks for early stopping
-            callbacks = [
-                EarlyStopping(
-                    monitor='val_accuracy',
-                    patience=7,
-                    restore_best_weights=True,
-                    mode='max'
-                ),
-                ReduceLROnPlateau(
-                    monitor='val_loss',
-                    factor=0.5,
-                    patience=4,
-                    min_lr=1e-6
-                )
-            ]
-            
-            # Train with reduced verbosity
-            history = model.fit(
-                X_cv_train, y_cv_train,
-                validation_data=(X_cv_val, y_cv_val),
-                epochs=30,  # Reduced for CV
-                batch_size=batch_size,
-                class_weight=class_weight_dict,
-                callbacks=callbacks,
-                verbose=0
-            )
-            
-            # Best validation accuracy for this fold
-            best_val_acc = max(history.history['val_accuracy'])
-            cv_scores.append(best_val_acc)
-            
-            # Clear session between folds
+        for tr_idx, va_idx in tscv.split(X_all):
             tf.keras.backend.clear_session()
-        
-        # Return mean CV score
-        mean_cv_score = np.mean(cv_scores)
-        std_cv_score = np.std(cv_scores)
-        
-        # Report intermediate values for pruning
-        trial.report(mean_cv_score, step=n_cv_folds)
-        
-        # Store CV details in trial
-        trial.set_user_attr('cv_scores', cv_scores)
-        trial.set_user_attr('cv_std', std_cv_score)
-        
-        # Prune if needed
+
+            X_cv_tr, X_cv_va = X_all[tr_idx], X_all[va_idx]
+            y_cv_tr, y_cv_va = y_all[tr_idx], y_all[va_idx]
+
+            m = build_cnn_lstm(
+                sequence_length = seq_len,
+                n_features      = n_features,
+                cnn_filters     = cnn_f,
+                lstm_units      = lstm_u,
+                dense_units     = dense_u,
+                dropout_rate    = dropout,
+                l2_reg          = l2_reg,
+                learning_rate   = lr,
+            )
+
+            cw  = compute_class_weight("balanced",
+                                       classes=np.unique(y_cv_tr), y=y_cv_tr)
+            h = m.fit(
+                X_cv_tr, y_cv_tr,
+                validation_data = (X_cv_va, y_cv_va),
+                epochs          = 30,
+                batch_size      = batch_size,
+                class_weight    = dict(enumerate(cw)),
+                callbacks       = [
+                    EarlyStopping(monitor="val_accuracy", patience=7,
+                                  restore_best_weights=True, mode="max"),
+                    ReduceLROnPlateau(monitor="val_loss", factor=0.5,
+                                     patience=4, min_lr=1e-6),
+                ],
+                verbose = 0,
+            )
+            cv_scores.append(max(h.history["val_accuracy"]))
+
+        mean_score = float(np.mean(cv_scores))
+        std_score  = float(np.std(cv_scores))
+
+        trial.set_user_attr("cv_scores", cv_scores)
+        trial.set_user_attr("cv_std",    std_score)
+        trial.report(mean_score, step=n_cv_folds)
+
         if trial.should_prune():
             raise optuna.TrialPruned()
-        
-        return mean_cv_score
-    
+
+        return mean_score
+
     return objective
 
 
-def run_optuna_optimization(
-    X_train: np.ndarray,
-    y_train: np.ndarray,
-    X_val: np.ndarray,
-    y_val: np.ndarray,
+def run_optuna(
+    X_train:    np.ndarray,
+    y_train:    np.ndarray,
+    X_val:      np.ndarray,
+    y_val:      np.ndarray,
     n_features: int,
-    sequence_length: int,
-    n_trials: int = 20,
-    n_cv_folds: int = 3,
-    timeout: int = None
-) -> Dict[str, Any]:
-    """
-    Run Optuna hyperparameter optimization with cross-validation.
-    
-    Args:
-        X_train, y_train: Training data
-        X_val, y_val: Validation data
-        n_features: Number of features
-        sequence_length: Sequence length
-        n_trials: Number of optimization trials (default: 20)
-        n_cv_folds: Number of CV folds (default: 3)
-        timeout: Maximum time in seconds (optional)
-        
-    Returns:
-        Dictionary with best parameters and study results
-    """
+    seq_len:    int,
+    n_trials:   int            = 20,
+    n_cv_folds: int            = 3,
+    timeout:    Optional[int]  = None,
+) -> Optional[Dict[str, Any]]:
+    """Run Optuna search and return best hyperparameter dict."""
     if not OPTUNA_AVAILABLE:
-        print("   ⚠️  Optuna not available, skipping optimization")
+        print("Optuna not available — skipping hyperparameter search")
         return None
-    
-    import optuna
-    from optuna.pruners import MedianPruner
+
+    from optuna.pruners  import MedianPruner
     from optuna.samplers import TPESampler
-    
+
     print("\n" + "=" * 60)
-    print("🔍 Optuna Hyperparameter Optimization (with Cross-Validation)")
+    print("  Optuna Hyperparameter Search (TimeSeriesSplit CV)")
     print("=" * 60)
-    print(f"   Trials: {n_trials}")
-    print(f"   CV Folds: {n_cv_folds} (TimeSeriesSplit)")
-    print(f"   Timeout: {timeout}s" if timeout else "   Timeout: None")
-    print(f"   Note: Each trial trains {n_cv_folds} models for robust evaluation")
-    
-    # Create objective function
-    objective = create_optuna_objective(
+    print(f"  Trials:   {n_trials}")
+    print(f"  CV folds: {n_cv_folds}  (TimeSeriesSplit)")
+    print(f"  Timeout:  {timeout}s" if timeout else "  Timeout:  none")
+    print(f"  Each trial trains {n_cv_folds} models for robust evaluation\n")
+
+    objective = _build_optuna_objective(
         X_train, y_train, X_val, y_val,
-        n_features, sequence_length, n_cv_folds
+        n_features, seq_len, n_cv_folds,
     )
-    
-    # Create study with TPE sampler and median pruner
+
     study = optuna.create_study(
-        direction='maximize',
-        sampler=TPESampler(seed=42),
-        pruner=MedianPruner(n_startup_trials=3, n_warmup_steps=5)
+        direction = "maximize",
+        sampler   = TPESampler(seed=42),
+        pruner    = MedianPruner(n_startup_trials=3, n_warmup_steps=5),
     )
-    
-    # Suppress Optuna's default logging
     optuna.logging.set_verbosity(optuna.logging.WARNING)
-    
-    # Custom callback to show progress
-    def progress_callback(study, trial):
-        cv_std = trial.user_attrs.get('cv_std', 0)
-        val_acc_str = f"{trial.value:.4f}" if trial.value is not None else "N/A"
-        std_str = f"±{cv_std:.4f}" if cv_std else ""
-        print(f"   Trial {trial.number + 1}/{n_trials}: "
-              f"CV_acc={val_acc_str}{std_str} | "
+
+    def _cb(study, trial):
+        cv_std = trial.user_attrs.get("cv_std", 0.0)
+        val    = trial.value if trial.value else 0.0
+        print(f"  Trial {trial.number+1:>3}/{n_trials}  "
+              f"cv_acc={val:.4f} +/-{cv_std:.4f}  "
               f"best={study.best_value:.4f}")
-    
-    print("\n   Running optimization...")
+
     study.optimize(
         objective,
-        n_trials=n_trials,
-        timeout=timeout,
-        callbacks=[progress_callback],
-        show_progress_bar=False
+        n_trials          = n_trials,
+        timeout           = timeout,
+        callbacks         = [_cb],
+        show_progress_bar = False,
     )
-    
-    # Extract best parameters
-    best_params = study.best_params
-    best_value = study.best_value
-    best_trial = study.best_trial
-    
-    # Reconstruct architecture from best params
-    n_cnn_layers = best_params['n_cnn_layers']
-    cnn_filters = [best_params[f'cnn_filters_{i}'] for i in range(n_cnn_layers)]
-    
-    n_lstm_layers = best_params['n_lstm_layers']
-    lstm_units = [best_params[f'lstm_units_{i}'] for i in range(n_lstm_layers)]
-    
-    n_dense_layers = best_params['n_dense_layers']
-    dense_units = [best_params[f'dense_units_{i}'] for i in range(n_dense_layers)]
-    
-    # Get CV details from best trial
-    cv_scores = best_trial.user_attrs.get('cv_scores', [])
-    cv_std = best_trial.user_attrs.get('cv_std', 0)
-    
-    print(f"\n   ✅ Optimization Complete!")
-    print(f"\n   📊 Best Cross-Validation Accuracy: {best_value*100:.2f}% (±{cv_std*100:.2f}%)")
-    if cv_scores:
-        print(f"      Fold scores: {[f'{s*100:.1f}%' for s in cv_scores]}")
-    print(f"\n   🏆 Best Hyperparameters:")
-    print(f"      CNN filters: {cnn_filters}")
-    print(f"      LSTM units: {lstm_units}")
-    print(f"      Dense units: {dense_units}")
-    print(f"      Dropout: {best_params['dropout']:.2f}")
-    print(f"      L2 reg: {best_params['l2_reg']:.6f}")
-    print(f"      Learning rate: {best_params['learning_rate']:.6f}")
-    print(f"      Batch size: {best_params['batch_size']}")
-    
+
+    bp      = study.best_params
+    best_t  = study.best_trial
+    cv_std  = best_t.user_attrs.get("cv_std",    0.0)
+    cv_sc   = best_t.user_attrs.get("cv_scores", [])
+
+    n_cnn   = bp["n_cnn_layers"]
+    n_lstm_ = bp["n_lstm_layers"]
+    n_dn    = bp["n_dense_layers"]
+    cnn_f   = [bp[f"cnn_f_{i}"]   for i in range(n_cnn)]
+    lstm_u  = [bp[f"lstm_u_{i}"]  for i in range(n_lstm_)]
+    dense_u = [bp[f"dense_u_{i}"] for i in range(n_dn)]
+
+    print(f"\n  Best CV accuracy: {study.best_value*100:.2f}% +/-{cv_std*100:.2f}%")
+    print(f"  Fold scores: {[f'{s*100:.1f}%' for s in cv_sc]}")
+    print(f"\n  Best hyperparameters:")
+    print(f"    CNN filters:  {cnn_f}")
+    print(f"    LSTM units:   {lstm_u}")
+    print(f"    Dense units:  {dense_u}")
+    print(f"    Dropout:      {bp['dropout']:.2f}")
+    print(f"    L2 reg:       {bp['l2_reg']:.6f}")
+    print(f"    LR:           {bp['lr']:.6f}")
+    print(f"    Batch size:   {bp['batch_size']}")
     print("=" * 60 + "\n")
-    
+
     return {
-        'best_params': best_params,
-        'best_value': best_value,
-        'cv_std': cv_std,
-        'cv_scores': cv_scores,
-        'cnn_filters': cnn_filters,
-        'lstm_units': lstm_units,
-        'dense_units': dense_units,
-        'dropout': best_params['dropout'],
-        'l2_reg': best_params['l2_reg'],
-        'learning_rate': best_params['learning_rate'],
-        'batch_size': best_params['batch_size'],
-        'n_trials': len(study.trials),
-        'n_cv_folds': n_cv_folds,
-        'study': study
+        "cnn_filters": cnn_f,
+        "lstm_units":  lstm_u,
+        "dense_units": dense_u,
+        "dropout":     bp["dropout"],
+        "l2_reg":      bp["l2_reg"],
+        "lr":          bp["lr"],
+        "batch_size":  bp["batch_size"],
+        "best_cv_acc": study.best_value,
+        "cv_std":      cv_std,
+        "cv_scores":   cv_sc,
+        "n_trials":    len(study.trials),
+        "n_cv_folds":  n_cv_folds,
     }
 
 
-# ============================================================
-# Save Model
-# ============================================================
+# ==================================================================
+# SAVE ARTIFACTS
+# ==================================================================
 
-def save_model(
-    model: Model,
-    scaler: RobustScaler,
+def save_artifacts(
+    model:         Model,
+    scaler:        RobustScaler,
     feature_names: List[str],
-    config: Dict,
-    metrics: Dict,
-    history: Dict,
-    selected_indices: List[int],
-    output_dir: Path
+    config:        Dict,
+    metrics:       Dict,
+    history:       Dict,
+    output_dir:    Path,
 ) -> None:
-    """Save model, metadata, and training artifacts."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    
-    print(f"\n💾 Saving model to: {output_dir}")
-    
-    # Save Keras model
-    model_path = output_dir / 'cnn_lstm_v31_model.keras'
-    model.save(model_path)
-    print(f"   ✅ Model: {model_path.name}")
-    
-    # Save metadata
-    metadata = {
-        'scaler': scaler,
-        'feature_names': feature_names,
-        'selected_indices': selected_indices
-    }
-    metadata_path = output_dir / 'cnn_lstm_v31_metadata.pkl'
-    with open(metadata_path, 'wb') as f:
-        pickle.dump(metadata, f)
-    print(f"   ✅ Metadata: {metadata_path.name}")
-    
-    # Save config
-    config_path = output_dir / 'cnn_lstm_v31_config.yaml'
-    with open(config_path, 'w') as f:
+
+    print(f"\n  Saving to: {output_dir}")
+
+    model.save(output_dir / "cnn_lstm_v32_model.keras")
+    print("    Model saved  (cnn_lstm_v32_model.keras)")
+
+    with open(output_dir / "cnn_lstm_v32_metadata.pkl", "wb") as f:
+        pickle.dump({"scaler": scaler, "feature_names": feature_names}, f)
+    print("    Metadata saved  (scaler + feature names)")
+
+    with open(output_dir / "cnn_lstm_v32_config.yaml", "w") as f:
         yaml.dump(config, f, default_flow_style=False)
-    print(f"   ✅ Config: {config_path.name}")
-    
-    # Save metrics
-    metrics_path = output_dir / 'cnn_lstm_v31_metrics.json'
-    with open(metrics_path, 'w') as f:
+    print("    Config saved")
+
+    with open(output_dir / "cnn_lstm_v32_metrics.json", "w") as f:
         json.dump(metrics, f, indent=2)
-    print(f"   ✅ Metrics: {metrics_path.name}")
-    
-    # Save history
-    history_path = output_dir / 'cnn_lstm_v31_history.json'
-    with open(history_path, 'w') as f:
+    print("    Metrics saved")
+
+    with open(output_dir / "cnn_lstm_v32_history.json", "w") as f:
         json.dump(history, f, indent=2)
-    print(f"   ✅ History: {history_path.name}")
+    print("    Training history saved")
 
 
-# ============================================================
-# Main
-# ============================================================
+# ==================================================================
+# MAIN
+# ==================================================================
 
 def main():
-    parser = argparse.ArgumentParser(
-        description='Train CNN-LSTM v3.1 (Simplified) for crypto price prediction'
+    p = argparse.ArgumentParser(
+        description="Train CNN-LSTM v3.2 on pre-selected Boruta features",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    
-    # Data arguments
-    parser.add_argument('--data', type=str, default=None,
-                        help='Path to CSV data file')
-    parser.add_argument('--horizon', type=int, default=DEFAULT_HORIZON,
-                        help=f'Prediction horizon in minutes (default: {DEFAULT_HORIZON})')
-    parser.add_argument('--threshold', type=float, default=DEFAULT_DIRECTION_THRESHOLD,
-                        help=f'Direction threshold (default: {DEFAULT_DIRECTION_THRESHOLD})')
-    
-    # Feature arguments
-    parser.add_argument('--no-sentiment', action='store_true',
-                        help='Disable sentiment features')
-    parser.add_argument('--no-onchain', action='store_true',
-                        help='Disable on-chain blockchain features')
-    parser.add_argument('--no-technical', action='store_true',
-                        help='Disable technical indicator features')
-    parser.add_argument('--onchain-only', action='store_true',
-                        help='Use ONLY on-chain features (disables technical and sentiment)')
-    parser.add_argument('--clear-onchain-cache', action='store_true',
-                        help='Clear on-chain data cache before fetching')
-    parser.add_argument('--no-boruta', action='store_true',
-                        help='Disable Boruta feature selection')
-    parser.add_argument('--max-features', type=int, default=DEFAULT_MAX_FEATURES,
-                        help=f'Max features after Boruta (default: {DEFAULT_MAX_FEATURES})')
-    
-    # Optuna arguments
-    parser.add_argument('--optuna', action='store_true',
-                        help='Enable Optuna hyperparameter optimization')
-    parser.add_argument('--optuna-trials', type=int, default=20,
-                        help='Number of Optuna trials (default: 20)')
-    parser.add_argument('--optuna-cv-folds', type=int, default=3,
-                        help='Number of cross-validation folds for Optuna (default: 3)')
-    parser.add_argument('--optuna-timeout', type=int, default=None,
-                        help='Optuna timeout in seconds (default: None)')
-    
-    # Architecture arguments (v3.1 simplified defaults)
-    parser.add_argument('--sequence-length', type=int, default=DEFAULT_SEQUENCE_LENGTH,
-                        help=f'Sequence length (default: {DEFAULT_SEQUENCE_LENGTH})')
-    parser.add_argument('--cnn-filters', type=str, default=DEFAULT_CNN_FILTERS,
-                        help=f'CNN filters (default: {DEFAULT_CNN_FILTERS})')
-    parser.add_argument('--lstm-units', type=str, default=DEFAULT_LSTM_UNITS,
-                        help=f'LSTM units (default: {DEFAULT_LSTM_UNITS})')
-    parser.add_argument('--dense-units', type=str, default=DEFAULT_DENSE_UNITS,
-                        help=f'Dense units (default: {DEFAULT_DENSE_UNITS})')
-    parser.add_argument('--dropout', type=float, default=DEFAULT_DROPOUT,
-                        help=f'Dropout rate (default: {DEFAULT_DROPOUT})')
-    parser.add_argument('--l2-reg', type=float, default=DEFAULT_L2_REG,
-                        help=f'L2 regularization (default: {DEFAULT_L2_REG})')
-    
-    # Training arguments
-    parser.add_argument('--epochs', type=int, default=DEFAULT_EPOCHS,
-                        help=f'Training epochs (default: {DEFAULT_EPOCHS})')
-    parser.add_argument('--batch-size', type=int, default=DEFAULT_BATCH_SIZE,
-                        help=f'Batch size (default: {DEFAULT_BATCH_SIZE})')
-    parser.add_argument('--learning-rate', type=float, default=DEFAULT_LEARNING_RATE,
-                        help=f'Learning rate (default: {DEFAULT_LEARNING_RATE})')
-    parser.add_argument('--patience', type=int, default=15,
-                        help='Early stopping patience (default: 15)')
-    
-    # Output arguments
-    parser.add_argument('--output', type=str, default=None,
-                        help='Output directory for model')
-    
-    # Other
-    parser.add_argument('--cpu', action='store_true',
-                        help='Force CPU-only mode')
-    
-    args = parser.parse_args()
-    
-    # Print banner
+
+    p.add_argument("--data",            required=True,
+                   help="Path to btc_features_selected_tunable.csv")
+    p.add_argument("--sequence-length", type=int,   default=DEFAULT_SEQUENCE_LENGTH,
+                   help="Context window in days (try 3, 5, 7)")
+    p.add_argument("--cnn-filters",     default=DEFAULT_CNN_FILTERS,
+                   help="Comma-separated CNN filter sizes")
+    p.add_argument("--lstm-units",      default=DEFAULT_LSTM_UNITS,
+                   help="Comma-separated LSTM unit counts")
+    p.add_argument("--dense-units",     default=DEFAULT_DENSE_UNITS,
+                   help="Comma-separated Dense unit counts")
+    p.add_argument("--dropout",         type=float, default=DEFAULT_DROPOUT)
+    p.add_argument("--l2-reg",          type=float, default=DEFAULT_L2_REG)
+    p.add_argument("--learning-rate",   type=float, default=DEFAULT_LR)
+    p.add_argument("--epochs",          type=int,   default=DEFAULT_EPOCHS)
+    p.add_argument("--batch-size",      type=int,   default=DEFAULT_BATCH_SIZE)
+    p.add_argument("--patience",        type=int,   default=DEFAULT_PATIENCE)
+    p.add_argument("--optuna",          action="store_true",
+                   help="Run Optuna search before final training")
+    p.add_argument("--optuna-trials",   type=int,   default=20)
+    p.add_argument("--optuna-cv-folds", type=int,   default=3,
+                   help="TimeSeriesSplit folds per Optuna trial")
+    p.add_argument("--optuna-timeout",  type=int,   default=None,
+                   help="Wall-clock limit (seconds) for Optuna")
+    p.add_argument("--output",          default=str(MODEL_DIR),
+                   help="Directory to save model and artifacts")
+    p.add_argument("--cpu",             action="store_true")
+
+    args = p.parse_args()
+
     print("\n" + "=" * 60)
-    print("🚀 ServoTrader CNN-LSTM Training (v3.1 Simplified)")
+    print("  ServoTrader CNN-LSTM v3.2  (Pre-Selected Features)")
     print("=" * 60)
-    print(f"Start time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    
-    # Find data file
-    if args.data:
-        data_path = Path(args.data)
-    else:
-        # Try to find data in common locations
-        possible_paths = [
-            DAILY_DATA_DIR / "BTCUSDT.csv",
-            DATA_DIR / "BTCUSDT.csv",
-            Path("data/daily_historical/BTCUSDT.csv"),
-            Path("data/BTCUSDT.csv"),
-            Path("BTCUSDT.csv")
-        ]
-        data_path = None
-        for p in possible_paths:
-            if p.exists():
-                data_path = p
-                break
-        
-        if data_path is None:
-            print("\n❌ No data file found!")
-            print("Please specify data path with --data argument")
-            print("Or place BTCUSDT.csv in one of these locations:")
-            for p in possible_paths:
-                print(f"   - {p}")
-            sys.exit(1)
-    
-    if not data_path.exists():
-        print(f"\n❌ Data file not found: {data_path}")
-        sys.exit(1)
-    
-    print(f"\n📂 Data: {data_path}")
-    print(f"🎯 Horizon: {args.horizon} minutes")
-    print(f"📊 Max features: {args.max_features}")
-    print(f"🔢 Sequence length: {args.sequence_length}")
-    
-    # Show feature configuration
-    if args.onchain_only:
-        print(f"🔗 Feature mode: ON-CHAIN ONLY")
-    else:
-        features_enabled = []
-        if not args.no_technical:
-            features_enabled.append("Technical")
-        if not args.no_sentiment:
-            features_enabled.append("Sentiment")
-        if not args.no_onchain:
-            features_enabled.append("On-Chain")
-        print(f"📊 Features: {', '.join(features_enabled) if features_enabled else 'None'}")
-    
-    # Parse architecture strings
-    cnn_filters = [int(x) for x in args.cnn_filters.split(',')]
-    lstm_units = [int(x) for x in args.lstm_units.split(',')]
-    dense_units = [int(x) for x in args.dense_units.split(',')]
-    
-    # Clear on-chain cache if requested
-    if args.clear_onchain_cache:
-        print("\n🗑️  Clearing on-chain cache...")
-        cache_dir = Path.home() / ".servo_trader" / "onchain_cache"
-        if cache_dir.exists():
-            import shutil
-            shutil.rmtree(cache_dir)
-            print(f"   ✅ Cleared: {cache_dir}")
-        else:
-            print(f"   ℹ️  Cache directory doesn't exist: {cache_dir}")
-    
-    # Handle --onchain-only flag
-    if args.onchain_only:
-        print("\n🔗 ON-CHAIN ONLY MODE: Using only blockchain features")
-        args.no_technical = True
-        args.no_sentiment = True
-        args.no_onchain = False  # Ensure on-chain is enabled
-    
-    # Prepare data
-    (X_train, X_val, X_test, y_train, y_val, y_test,
-     scaler, feature_names, df, selected_indices) = prepare_data(
-        data_path=str(data_path),
-        horizon_minutes=args.horizon,
-        sequence_length=args.sequence_length,
-        direction_threshold=args.threshold,
-        include_technical=not args.no_technical,
-        include_sentiment=not args.no_sentiment,
-        include_onchain=not args.no_onchain,
-        use_boruta=not args.no_boruta,
-        max_features=args.max_features,
-        train_ratio=DEFAULT_TRAIN_RATIO,
-        val_ratio=DEFAULT_VAL_RATIO
+    print(f"  Start:  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"  Data:   {args.data}")
+    print(f"  Window: {args.sequence_length} days")
+
+    cnn_filters = [int(x) for x in args.cnn_filters.split(",")]
+    lstm_units  = [int(x) for x in args.lstm_units.split(",")]
+    dense_units = [int(x) for x in args.dense_units.split(",")]
+
+    # Load data
+    (X_train, X_val, X_test,
+     y_train, y_val, y_test,
+     scaler, feature_names) = load_preselected_data(
+        csv_path        = args.data,
+        sequence_length = args.sequence_length,
+        train_ratio     = DEFAULT_TRAIN_RATIO,
+        val_ratio       = DEFAULT_VAL_RATIO,
     )
-    
-    # Get number of features
     n_features = X_train.shape[2]
-    
-    # Output directory
-    if args.output:
-        output_dir = Path(args.output)
-    else:
-        output_dir = MODEL_DIR
-    
-    # Run Optuna optimization if requested
+
+    # Optional Optuna search
     optuna_results = None
     if args.optuna:
-        if OPTUNA_AVAILABLE:
-            optuna_results = run_optuna_optimization(
-                X_train=X_train,
-                y_train=y_train,
-                X_val=X_val,
-                y_val=y_val,
-                n_features=n_features,
-                sequence_length=args.sequence_length,
-                n_trials=args.optuna_trials,
-                n_cv_folds=args.optuna_cv_folds,
-                timeout=args.optuna_timeout
-            )
-            
-            if optuna_results:
-                # Use optimized parameters
-                cnn_filters = optuna_results['cnn_filters']
-                lstm_units = optuna_results['lstm_units']
-                dense_units = optuna_results['dense_units']
-                args.dropout = optuna_results['dropout']
-                args.l2_reg = optuna_results['l2_reg']
-                args.learning_rate = optuna_results['learning_rate']
-                args.batch_size = optuna_results['batch_size']
-                
-                print("\n📊 Using Optuna-optimized parameters for final training...")
-        else:
-            print("\n⚠️  Optuna not available, using default parameters...")
-    
+        optuna_results = run_optuna(
+            X_train, y_train, X_val, y_val,
+            n_features  = n_features,
+            seq_len     = args.sequence_length,
+            n_trials    = args.optuna_trials,
+            n_cv_folds  = args.optuna_cv_folds,
+            timeout     = args.optuna_timeout,
+        )
+        if optuna_results:
+            cnn_filters        = optuna_results["cnn_filters"]
+            lstm_units         = optuna_results["lstm_units"]
+            dense_units        = optuna_results["dense_units"]
+            args.dropout       = optuna_results["dropout"]
+            args.l2_reg        = optuna_results["l2_reg"]
+            args.learning_rate = optuna_results["lr"]
+            args.batch_size    = optuna_results["batch_size"]
+            print("  Using Optuna-tuned parameters for final training")
+
     # Build model
-    model = build_cnn_lstm_model_v31(
-        sequence_length=args.sequence_length,
-        n_features=n_features,
-        cnn_filters=cnn_filters,
-        lstm_units=lstm_units,
-        dense_units=dense_units,
-        dropout_rate=args.dropout,
-        l2_reg=args.l2_reg,
-        learning_rate=args.learning_rate
+    model = build_cnn_lstm(
+        sequence_length = args.sequence_length,
+        n_features      = n_features,
+        cnn_filters     = cnn_filters,
+        lstm_units      = lstm_units,
+        dense_units     = dense_units,
+        dropout_rate    = args.dropout,
+        l2_reg          = args.l2_reg,
+        learning_rate   = args.learning_rate,
     )
-    
-    # Print model summary
     model.summary()
-    
-    # Train model
+
+    # Train
     model, history = train_model(
-        model=model,
-        X_train=X_train,
-        y_train=y_train,
-        X_val=X_val,
-        y_val=y_val,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        patience=args.patience,
-        output_dir=output_dir
+        model      = model,
+        X_train    = X_train,
+        y_train    = y_train,
+        X_val      = X_val,
+        y_val      = y_val,
+        epochs     = args.epochs,
+        batch_size = args.batch_size,
+        patience   = args.patience,
+        output_dir = Path(args.output),
     )
-    
+
     # Evaluate
     metrics = evaluate_model(model, X_test, y_test)
-    
-    # Save config
+
+    # Save
     config = {
-        'version': '3.1',
-        'architecture': 'CNN-LSTM-Simplified',
-        'horizon_minutes': args.horizon,
-        'sequence_length': args.sequence_length,
-        'direction_threshold': args.threshold,
-        'include_technical': not args.no_technical,
-        'include_sentiment': not args.no_sentiment,
-        'include_onchain': not args.no_onchain,
-        'onchain_only': args.onchain_only,
-        'use_boruta': not args.no_boruta,
-        'use_optuna': args.optuna,
-        'optuna_trials': args.optuna_trials if args.optuna else 0,
-        'optuna_cv_folds': args.optuna_cv_folds if args.optuna else 0,
-        'optuna_best_cv_acc': optuna_results['best_value'] if optuna_results else None,
-        'optuna_cv_std': optuna_results.get('cv_std', 0) if optuna_results else None,
-        'max_features': args.max_features,
-        'cnn_filters': cnn_filters,
-        'lstm_units': lstm_units,
-        'dense_units': dense_units,
-        'dropout': args.dropout,
-        'l2_reg': args.l2_reg,
-        'learning_rate': args.learning_rate,
-        'epochs': args.epochs,
-        'batch_size': args.batch_size,
-        'n_features': n_features,
-        'feature_names': feature_names,
-        'total_parameters': model.count_params(),
-        'data_path': str(data_path)
+        "version":           "3.2",
+        "architecture":      "CNN-LSTM-PreSelected",
+        "data_path":         str(args.data),
+        "sequence_length":   args.sequence_length,
+        "n_features":        n_features,
+        "feature_names":     feature_names,
+        "target_column":     TARGET_COL,
+        "cnn_filters":       cnn_filters,
+        "lstm_units":        lstm_units,
+        "dense_units":       dense_units,
+        "dropout":           args.dropout,
+        "l2_reg":            args.l2_reg,
+        "learning_rate":     args.learning_rate,
+        "epochs":            args.epochs,
+        "batch_size":        args.batch_size,
+        "patience":          args.patience,
+        "total_parameters":  model.count_params(),
+        "use_optuna":        args.optuna,
+        "optuna_trials":     args.optuna_trials   if args.optuna else 0,
+        "optuna_cv_folds":   args.optuna_cv_folds if args.optuna else 0,
+        "optuna_best_cv_acc":optuna_results["best_cv_acc"] if optuna_results else None,
+        "optuna_cv_std":     optuna_results["cv_std"]      if optuna_results else None,
     }
-    
-    # Save everything
-    save_model(
-        model=model,
-        scaler=scaler,
-        feature_names=feature_names,
-        config=config,
-        metrics=metrics,
-        history=history,
-        selected_indices=selected_indices,
-        output_dir=output_dir
+
+    save_artifacts(
+        model=model, scaler=scaler, feature_names=feature_names,
+        config=config, metrics=metrics, history=history,
+        output_dir=Path(args.output),
     )
-    
+
     # Final summary
+    best_epoch = int(np.argmax(history["val_accuracy"])) + 1
+    best_val   = max(history["val_accuracy"])
+
     print("\n" + "=" * 60)
-    print("✅ Training Complete (v3.1 Simplified)")
+    print("  Training Complete (v3.2)")
     print("=" * 60)
-    print(f"End time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    
+    print(f"  Finished:      {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"\n  Test Accuracy: {metrics['accuracy']*100:.2f}%")
+    print(f"  Test F1:       {metrics['f1']:.4f}")
+    print(f"  AUC-ROC:       {metrics['auc_roc']:.4f}")
+    print(f"  DOWN accuracy: {metrics['down_accuracy']*100:.1f}%")
+    print(f"  UP accuracy:   {metrics['up_accuracy']*100:.1f}%")
+    print(f"\n  Best epoch:    {best_epoch}  ({best_val*100:.2f}% val acc)")
+    print(f"  Parameters:    {model.count_params():,}")
+    print(f"  Param/sample:  {model.count_params()/len(X_train):.1f}:1")
+
     if optuna_results:
-        print(f"\n🔍 Optuna Optimization:")
-        print(f"   Trials: {optuna_results['n_trials']}")
-        print(f"   CV Folds: {optuna_results.get('n_cv_folds', 'N/A')}")
-        cv_std = optuna_results.get('cv_std', 0)
-        print(f"   Best CV Accuracy: {optuna_results['best_value']*100:.2f}% (±{cv_std*100:.2f}%)")
-        cv_scores = optuna_results.get('cv_scores', [])
-        if cv_scores:
-            print(f"   Fold scores: {[f'{s*100:.1f}%' for s in cv_scores]}")
-    
-    print(f"\n📊 Final Results:")
-    print(f"   Test Accuracy: {metrics['accuracy']*100:.2f}%")
-    print(f"   Test F1: {metrics['f1']:.4f}")
-    print(f"   Test AUC-ROC: {metrics['auc_roc']:.4f}")
-    print(f"   Down Accuracy: {metrics['down_accuracy']*100:.2f}%")
-    print(f"   Up Accuracy: {metrics['up_accuracy']*100:.2f}%")
-    
-    best_epoch = np.argmax(history['val_accuracy']) + 1
-    best_val_acc = max(history['val_accuracy'])
-    print(f"\n📈 Best: Epoch {best_epoch} with {best_val_acc*100:.2f}% val accuracy")
-    
-    print(f"\n🏗️  Final Architecture:")
-    print(f"   CNN filters: {cnn_filters}")
-    print(f"   LSTM units: {lstm_units}")
-    print(f"   Dense units: {dense_units}")
-    print(f"   Dropout: {args.dropout}")
-    print(f"   L2 reg: {args.l2_reg}")
-    print(f"   Learning rate: {args.learning_rate}")
-    print(f"   Batch size: {args.batch_size}")
-    
-    print(f"\n📊 v3.1 vs v3.0 Comparison:")
-    print(f"   Parameters: {model.count_params():,} vs 176,219 (v3.0)")
-    print(f"   Features: {n_features} vs 117 (v3.0)")
-    print(f"   Sequence length: {args.sequence_length} vs 30 (v3.0)")
-    print(f"   Param/Sample ratio: {model.count_params() / len(X_train):.1f}:1 vs 87:1 (v3.0)")
-    
-    print(f"\n💾 Model saved to: {output_dir}")
-    print("\n" + "=" * 60)
+        print(f"\n  Optuna trials: {optuna_results['n_trials']}")
+        print(f"  Best CV acc:   {optuna_results['best_cv_acc']*100:.2f}% "
+              f"+/-{optuna_results['cv_std']*100:.2f}%")
+
+    print(f"\n  Saved to: {args.output}")
+    print("=" * 60 + "\n")
 
 
 if __name__ == "__main__":
