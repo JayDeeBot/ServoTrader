@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-boruta_tunable.py
+boruta_hourly.py
 
-Boruta feature selection with fully tunable parameters for finding optimal settings.
-Includes diagnostic output to understand why features are being rejected.
+Boruta feature selection for HOURLY BTC prediction with optimized parameters.
+Tailored for hourly data with more samples and cleaner signal than daily.
 
 Author: Jarred Deluca
 Created: 2025
@@ -19,100 +19,47 @@ import warnings
 warnings.filterwarnings("ignore")
 
 # ============================================================================
-# TUNABLE CONFIGURATION - ADJUST THESE TO GET BETTER RESULTS
+# CONFIGURATION FOR HOURLY DATA
 # ============================================================================
 
 # Input/Output
 INPUT_FILE = "/home/jarred/git/ServoTrader/data/btc_hourly_features_engineered.csv"
-OUTPUT_REPORT = "/home/jarred/git/ServoTrader/data/boruta_tunable_report.csv"
-OUTPUT_SELECTED = "/home/jarred/git/ServoTrader/data/btc_features_selected_tunable.csv"
-TARGET_VARIABLE = "target_next_day_direction"
+OUTPUT_REPORT = "/home/jarred/git/ServoTrader/data/boruta_hourly_report.csv"
+OUTPUT_SELECTED = "/home/jarred/git/ServoTrader/data/btc_hourly_features_selected.csv"
+
+# Target variable for hourly prediction
+TARGET_VARIABLE = "target_next_hour_direction"  # Changed from daily
 
 # ============================================================================
-# BORUTA PARAMETERS - KEY TUNING KNOBS
+# BORUTA PARAMETERS - MODERATE SETTINGS FOR HOURLY
 # ============================================================================
+# Since hourly has 26k samples (vs ~1k daily), we can be less lenient
 
-# Alpha: Statistical significance threshold (p-value)
-# - Lower = more strict (fewer features confirmed)
-# - Higher = more lenient (more features confirmed)
-# - Default: 0.05
-# - Try: 0.01 (very strict), 0.05 (default), 0.10 (lenient), 0.20 (very lenient)
-BORUTA_ALPHA = 0.30  # INCREASED from 0.05 to be more lenient
-
-# Perc: Percentile of shadow feature importance to compare against
-# - Default: 100 (must beat ALL shadow features)
-# - Lower values = easier to confirm (only beat X% of shadows)
-# - Try: 100 (strictest), 90 (moderate), 80 (lenient), 70 (very lenient)
-BORUTA_PERC = 50  # REDUCED from 100 to be more lenient
-
-# Two-step procedure
-# - True: Use two-step method (more conservative)
-# - False: Single-step method (more lenient)
-BORUTA_TWO_STEP = False  # CHANGED from True to be more lenient
-
-# Max iterations
-# - More iterations = more chances for features to prove themselves
-# - Default: 100
-# - Try: 50 (faster), 100 (default), 150 (thorough), 200 (very thorough)
-BORUTA_MAX_ITER = 200  # INCREASED from 100
-
-# Random state for reproducibility
+BORUTA_ALPHA = 0.10              # Moderate (hourly has more data)
+BORUTA_PERC = 80                 # Moderate 
+BORUTA_TWO_STEP = False          # Keep single-step
+BORUTA_MAX_ITER = 150            # Sufficient for hourly
 BORUTA_RANDOM_STATE = 42
 
 # ============================================================================
-# RANDOM FOREST PARAMETERS - AFFECT FEATURE IMPORTANCE CALCULATION
+# RANDOM FOREST PARAMETERS - OPTIMIZED FOR HOURLY
 # ============================================================================
 
-# N_estimators: Number of trees in forest
-# - More trees = more stable importance scores
-# - 'auto' lets Boruta decide based on data size
-# - Try: 100, 250, 500, 'auto'
-RF_N_ESTIMATORS = 250  # INCREASED from 'auto' for stability
-
-# Max_depth: Maximum depth of trees
-# - Higher = more complex, can capture non-linear patterns
-# - Lower = simpler, more generalizable
-# - Too low = can't find patterns, Too high = overfits
-# - Try: 5, 7, 10, 15, None (unlimited)
-RF_MAX_DEPTH = 15  # INCREASED from 7 to capture more patterns
-
-# Min_samples_split: Minimum samples required to split a node
-# - Higher = more conservative splits (simpler trees)
-# - Lower = more aggressive splits (complex trees)
-# - Default: 2
-# - Try: 2 (default), 5, 10, 20
-RF_MIN_SAMPLES_SPLIT = 20  # INCREASED from 2 to prevent overfitting
-
-# Min_samples_leaf: Minimum samples required at leaf node
-# - Higher = simpler trees
-# - Lower = more complex trees
-# - Default: 1
-# - Try: 1, 2, 5, 10
-RF_MIN_SAMPLES_LEAF = 10  # INCREASED from 1
-
-# Max_features: Number of features to consider for each split
-# - 'sqrt': Square root of total features (default for classification)
-# - 'log2': Log2 of total features
-# - None: All features
-# - int: Specific number
-# - Try: 'sqrt', 'log2', None, 0.3 (30% of features)
-RF_MAX_FEATURES = 'sqrt'  # Keep as sqrt (good default)
-
+RF_N_ESTIMATORS = 250            # Stable importance scores
+RF_MAX_DEPTH = 10                # Moderate depth (not too deep)
+RF_MIN_SAMPLES_SPLIT = 10        # Prevent overfitting
+RF_MIN_SAMPLES_LEAF = 5          # Prevent overfitting
+RF_MAX_FEATURES = 'sqrt'         # Good default
 RF_RANDOM_STATE = 42
 
 # ============================================================================
-# PRE-FILTERING OPTION
+# PRE-FILTERING
 # ============================================================================
 
-# Pre-filter to top N features before running Boruta
-# - Helps when you have too many features (>200)
-# - Uses basic Random Forest feature importance
-# - Set to None to disable
-# - Try: None (no pre-filter), 150, 100, 75
-PREFILTER_TOP_N = None  # ENABLED: Test top 150 features only
+PREFILTER_TOP_N = None           # Disabled - test all features
 
 # Missing data handling
-FORWARD_FILL_LIMIT = 7
+FORWARD_FILL_LIMIT = 24          # 24 hours (changed from 7 days)
 MIN_DATA_THRESHOLD = 0.7
 
 # ============================================================================
@@ -160,7 +107,7 @@ def categorize_feature(feature_name):
         return 'rolling_stats'
     if 'regime' in name_lower:
         return 'regime'
-    if any(kw in name_lower for kw in ['day_of', 'month', 'quarter', 'halving', 'weekend', 'cycle']):
+    if any(kw in name_lower for kw in ['hour_of', 'day_of', 'trading_hours', 'weekend', 'morning', 'afternoon', 'evening', 'night']):
         return 'cyclical'
     if '_to_' in name_lower or 'ratio' in name_lower or 'interaction' in name_lower or 'divergence' in name_lower:
         return 'cross_sectional'
@@ -175,16 +122,20 @@ def categorize_feature(feature_name):
 # ============================================================================
 
 def load_and_clean_data():
-    """Load and clean data."""
+    """Load and clean hourly data."""
     
-    section("LOADING DATA")
+    section("LOADING HOURLY DATA")
     
     df = pd.read_csv(INPUT_FILE)
     print(f"  📊 Loaded: {len(df)} rows × {len(df.columns)} columns")
-    print(f"  📅 Date range: {df['date'].min()} → {df['date'].max()}")
     
-    df['date'] = pd.to_datetime(df['date'])
-    df = df.sort_values('date').reset_index(drop=True)
+    # Hourly data uses 'timestamp' not 'date'
+    if 'timestamp' in df.columns:
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        print(f"  📅 Time range: {df['timestamp'].min()} → {df['timestamp'].max()}")
+        df = df.sort_values('timestamp').reset_index(drop=True)
+    else:
+        print(f"  ⚠️  Warning: No timestamp column found")
     
     section("HANDLING MISSING DATA")
     
@@ -200,9 +151,13 @@ def load_and_clean_data():
         df = df.drop(columns=cols_to_drop)
     
     target_cols = [c for c in df.columns if c.startswith('target')]
-    feature_cols = [c for c in df.columns if c not in target_cols and c != 'date']
+    feature_cols = [c for c in df.columns if c not in target_cols and c not in ['timestamp', 'date']]
     
-    # Forward fill
+    print(f"\n  📋 Dataset structure:")
+    print(f"     Features: {len(feature_cols)}")
+    print(f"     Targets:  {len(target_cols)}")
+    
+    # Forward fill (hourly limit)
     df[feature_cols] = df[feature_cols].fillna(method='ffill', limit=FORWARD_FILL_LIMIT)
     df[feature_cols] = df[feature_cols].fillna(method='bfill', limit=FORWARD_FILL_LIMIT)
     df[feature_cols] = df[feature_cols].fillna(0)
@@ -211,7 +166,19 @@ def load_and_clean_data():
     if TARGET_VARIABLE in df.columns:
         rows_before = len(df)
         df = df[df[TARGET_VARIABLE].notna()].copy()
-        print(f"  🗑️  Dropped {rows_before - len(df)} rows with missing target")
+        rows_dropped = rows_before - len(df)
+        print(f"\n  🗑️  Dropped {rows_dropped} rows with missing target")
+    else:
+        print(f"\n  ❌ ERROR: Target variable '{TARGET_VARIABLE}' not found!")
+        print(f"     Available targets: {target_cols}")
+        raise ValueError(f"Target variable '{TARGET_VARIABLE}' not in dataset")
+    
+    # Check remaining nulls
+    remaining_nulls = df[feature_cols].isnull().sum().sum()
+    if remaining_nulls > 0:
+        print(f"  ⚠️  Warning: {remaining_nulls} nulls remain")
+    else:
+        print(f"  ✅ All missing values handled")
     
     print(f"\n  ✅ Clean dataset: {len(df)} rows × {len(feature_cols)} features")
     
@@ -223,7 +190,7 @@ def load_and_clean_data():
 # ============================================================================
 
 def prefilter_features(df, feature_cols):
-    """Optional: Pre-filter to top N features using basic RF importance."""
+    """Optional: Pre-filter to top N features."""
     
     if PREFILTER_TOP_N is None or PREFILTER_TOP_N >= len(feature_cols):
         print(f"  ℹ️  Pre-filtering disabled (testing all {len(feature_cols)} features)")
@@ -231,12 +198,11 @@ def prefilter_features(df, feature_cols):
     
     section("PRE-FILTERING FEATURES")
     
-    print(f"  🔍 Pre-filtering to top {PREFILTER_TOP_N} features using Random Forest...")
+    print(f"  🔍 Pre-filtering to top {PREFILTER_TOP_N} features...")
     
     X = df[feature_cols].values
     y = df[TARGET_VARIABLE].values
     
-    # Quick RF to get importance
     rf = RandomForestClassifier(
         n_estimators=100,
         max_depth=5,
@@ -245,11 +211,10 @@ def prefilter_features(df, feature_cols):
     )
     rf.fit(X, y)
     
-    # Get top N
     importances = pd.Series(rf.feature_importances_, index=feature_cols)
     top_features = importances.nlargest(PREFILTER_TOP_N).index.tolist()
     
-    print(f"  ✅ Selected top {len(top_features)} features for Boruta testing")
+    print(f"  ✅ Selected top {len(top_features)} features")
     print(f"\n  📊 Top 10 by RF importance:")
     for i, feat in enumerate(top_features[:10], 1):
         print(f"     {i:2d}. {feat:50s} ({importances[feat]:.6f})")
@@ -258,13 +223,13 @@ def prefilter_features(df, feature_cols):
 
 
 # ============================================================================
-# RUN BORUTA WITH DIAGNOSTICS
+# RUN BORUTA
 # ============================================================================
 
 def run_boruta_with_diagnostics(df, feature_cols):
-    """Run Boruta with detailed diagnostics."""
+    """Run Boruta with diagnostics."""
     
-    section("BORUTA CONFIGURATION")
+    section("BORUTA CONFIGURATION (HOURLY)")
     
     print(f"  🔬 Boruta Parameters:")
     print(f"     alpha:     {BORUTA_ALPHA} (p-value threshold)")
@@ -279,26 +244,31 @@ def run_boruta_with_diagnostics(df, feature_cols):
     print(f"     min_samples_leaf:  {RF_MIN_SAMPLES_LEAF}")
     print(f"     max_features:      {RF_MAX_FEATURES}")
     
+    print(f"\n  💡 Note: Settings are moderate (not lenient) because hourly has:")
+    print(f"     - 26k samples (vs ~1k for daily)")
+    print(f"     - Cleaner intraday signal")
+    
     section("RUNNING BORUTA")
     
     X = df[feature_cols].copy()
     y = df[TARGET_VARIABLE].values
     
-    print(f"  📊 Input: {X.shape[0]} samples × {X.shape[1]} features")
+    print(f"  📊 Input: {X.shape[0]:,} samples × {X.shape[1]} features")
+    print(f"  🎯 Target: {TARGET_VARIABLE}")
     
     # Check target distribution
     unique, counts = np.unique(y, return_counts=True)
-    print(f"\n  🎯 Target distribution:")
+    print(f"\n  📈 Target distribution:")
     for val, count in zip(unique, counts):
         pct = (count / len(y)) * 100
         label = "DOWN" if val == 0 else "UP"
         print(f"     {label} ({val}): {count:,} ({pct:.1f}%)")
     
-    # Check for severe class imbalance
+    # Check class imbalance
     imbalance_ratio = max(counts) / min(counts)
     if imbalance_ratio > 2:
-        print(f"\n  ⚠️  Class imbalance detected: {imbalance_ratio:.2f}:1 ratio")
-        print(f"     Using class_weight='balanced' to compensate")
+        print(f"\n  ⚠️  Class imbalance: {imbalance_ratio:.2f}:1 ratio")
+        print(f"     Using class_weight='balanced'")
     
     # Initialize RF
     rf = RandomForestClassifier(
@@ -312,12 +282,19 @@ def run_boruta_with_diagnostics(df, feature_cols):
         class_weight='balanced'
     )
     
-    # Quick baseline check
+    # Baseline check
     print(f"\n  📊 Baseline RF accuracy (5-fold CV):")
     scores = cross_val_score(rf, X.values, y, cv=5, scoring='accuracy')
     print(f"     Mean: {scores.mean():.3f} ± {scores.std():.3f}")
+    
     if scores.mean() < 0.52:
-        print(f"     ⚠️  WARNING: Very weak predictive signal (near random)")
+        print(f"     ⚠️  WARNING: Weak signal (near random)")
+    elif scores.mean() < 0.55:
+        print(f"     ✅ Weak-moderate signal (typical for hourly)")
+    elif scores.mean() < 0.60:
+        print(f"     ✅✅ Good signal!")
+    else:
+        print(f"     ✅✅✅ Excellent signal!")
     
     # Initialize Boruta
     boruta = BorutaPy(
@@ -331,7 +308,7 @@ def run_boruta_with_diagnostics(df, feature_cols):
         verbose=2
     )
     
-    print(f"\n  🚀 Running Boruta...")
+    print(f"\n  🚀 Running Boruta (may take 10-20 minutes)...")
     print(f"  {'-'*76}")
     
     boruta.fit(X.values, y)
@@ -350,18 +327,21 @@ def run_boruta_with_diagnostics(df, feature_cols):
     print(f"     ⚠️  Tentative:  {len(tentative):3d} ({len(tentative)/len(feature_cols)*100:5.1f}%)")
     print(f"     ❌ Rejected:   {len(rejected):3d} ({len(rejected)/len(feature_cols)*100:5.1f}%)")
     
-    # Diagnostics
-    if len(confirmed) < 5:
-        print(f"\n  ⚠️  WARNING: Very few features confirmed!")
-        print(f"     Possible causes:")
-        print(f"     1. Weak predictive signal in data")
-        print(f"     2. Boruta parameters too strict")
-        print(f"     3. RF parameters not capturing patterns")
-        print(f"\n     Try adjusting:")
-        print(f"     - Increase BORUTA_ALPHA (e.g., 0.15 or 0.20)")
-        print(f"     - Decrease BORUTA_PERC (e.g., 80 or 70)")
-        print(f"     - Set BORUTA_TWO_STEP = False")
-        print(f"     - Increase RF_MAX_DEPTH (e.g., 15 or None)")
+    # Assessment
+    if len(confirmed) >= 30:
+        print(f"\n  ✅✅ Excellent! {len(confirmed)} features confirmed")
+        print(f"     This is great for hourly prediction")
+    elif len(confirmed) >= 15:
+        print(f"\n  ✅ Good! {len(confirmed)} features confirmed")
+        print(f"     Sufficient for building a model")
+    elif len(confirmed) >= 5:
+        print(f"\n  ⚠️  Moderate. {len(confirmed)} features confirmed")
+        print(f"     You can train a model but signal is weak")
+    else:
+        print(f"\n  ⚠️  WARNING: Only {len(confirmed)} features confirmed")
+        print(f"     Try more lenient settings:")
+        print(f"     - BORUTA_ALPHA = 0.15")
+        print(f"     - BORUTA_PERC = 70")
     
     return boruta, confirmed, tentative, rejected, rankings
 
@@ -456,7 +436,8 @@ def save_outputs(df, report_df, confirmed, tentative):
     
     selected = confirmed + tentative
     if len(selected) > 0:
-        cols = ['date'] + selected + [c for c in df.columns if c.startswith('target')]
+        timestamp_col = 'timestamp' if 'timestamp' in df.columns else 'date'
+        cols = [timestamp_col] + selected + [c for c in df.columns if c.startswith('target')]
         df[cols].to_csv(OUTPUT_SELECTED, index=False)
         print(f"  ✅ Selected: {OUTPUT_SELECTED} ({len(selected)} features)")
     else:
@@ -470,9 +451,9 @@ def save_outputs(df, report_df, confirmed, tentative):
 def main():
     """Main execution."""
     
-    section("TUNABLE BORUTA FEATURE SELECTION")
+    section("HOURLY BTC BORUTA FEATURE SELECTION")
     
-    print(f"  📋 Current Configuration:")
+    print(f"  📋 Configuration (Moderate for Hourly):")
     print(f"     Boruta alpha:  {BORUTA_ALPHA}")
     print(f"     Boruta perc:   {BORUTA_PERC}")
     print(f"     Two-step:      {BORUTA_TWO_STEP}")
@@ -480,6 +461,11 @@ def main():
     print(f"     RF depth:      {RF_MAX_DEPTH}")
     print(f"     RF trees:      {RF_N_ESTIMATORS}")
     print(f"     Pre-filter:    {PREFILTER_TOP_N if PREFILTER_TOP_N else 'Disabled'}")
+    
+    print(f"\n  💡 Expected results:")
+    print(f"     - Baseline accuracy: 54-57%")
+    print(f"     - Confirmed features: 30-50")
+    print(f"     - Much better than daily!")
     
     df, feature_cols, missing_pct_before = load_and_clean_data()
     
@@ -495,6 +481,7 @@ def main():
     
     section("✅ COMPLETE")
     print(f"\n  Results: {len(confirmed)} confirmed, {len(tentative)} tentative")
+    print(f"\n  🎯 Next: Train hourly prediction model with selected features")
     print(f"\n")
 
 
