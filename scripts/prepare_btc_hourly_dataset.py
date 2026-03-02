@@ -1,45 +1,58 @@
 """
 prepare_btc_hourly_dataset.py
 
-Takes raw hourly BTC OHLCV data (from Binance via the existing pipeline) and
-engineers the 14 Boruta-confirmed features required by BTCTradingEnv.
+Engineers the 14 Boruta-confirmed features for BTCTradingEnv from the three
+existing data files produced by the ServoTrader collection pipeline.
 
-Confirmed Features (in order)
-------------------------------
-1.  rsi_24               – RSI(24) on close
-2.  adx_14               – ADX(14) — trend strength
-3.  stoch_k              – Stochastic %K (14,3)
-4.  stoch_d              – Stochastic %D (3-period SMA of %K)
-5.  bb_percent_b_48      – Bollinger %B with window=48
-6.  bb_percent_b_24      – Bollinger %B with window=24
-7.  volume_ratio_24      – volume / rolling_mean_volume(24)
-8.  vwap_deviation       – (close − vwap) / vwap
-9.  returns_6h           – 6-period log return
-10. bb_percent_b_12      – Bollinger %B with window=12
-11. returns_1h           – 1-period log return
-12. volatility_6h        – 6-period rolling std of log returns
-13. rsi_6                – RSI(6) on close
-14. trends_bitcoin_zscore– Google Trends index, z-scored (forward-filled daily → hourly)
+Source files (all already on disk)
+------------------------------------
+1. OHLCV (timezone-aware UTC):
+     /home/jarred/git/ServoTrader/data/hourly_historical/BTCUSDT.csv
+     Columns: timestamp, open, high, low, close, vwap, volume, count, symbol
 
-Input Data
-----------
-Expects a CSV with at minimum: timestamp, open, high, low, close, volume, [vwap]
-If vwap is missing it is computed from (high + low + close) / 3 as an approximation.
-If trends_bitcoin_zscore is missing it is filled with zeros (neutral) with a warning.
+2. Sentiment (timezone-naive, daily forward-filled to hourly):
+     /home/jarred/git/ServoTrader/data/btc_sentiment_hourly.csv
+     Relevant column: trends_bitcoin_zscore  (already z-scored — no extra work needed)
+
+3. On-chain (timezone-naive, daily forward-filled to hourly):
+     /home/jarred/git/ServoTrader/data/btc_onchain_hourly_metrics.csv
+     Not required for the 14 confirmed features. Loaded only so future
+     extensions can add on-chain columns without restructuring this script.
 
 Output
 ------
-CSV saved to `output_path` containing the original OHLCV columns PLUS all 14
-engineered features plus 'close' (for trade execution). Rows with NaN features
-(warm-up period) are dropped.
+     /home/jarred/git/ServoTrader/data/btc_hourly_features.csv
+     Contains OHLCV base columns + 14 Boruta-confirmed features.
+     NaN warm-up rows (from rolling windows) are dropped.
+
+14 Confirmed Boruta Features (in importance order)
+----------------------------------------------------
+ 1  rsi_24               — RSI(24) on close              [technical]
+ 2  adx_14               — ADX(14) trend strength         [technical]
+ 3  stoch_k              — Stochastic %K (14, 3)          [technical]
+ 4  stoch_d              — Stochastic %D (3-period SMA)   [technical]
+ 5  bb_percent_b_48      — Bollinger %B, window=48        [technical]
+ 6  bb_percent_b_24      — Bollinger %B, window=24        [technical]
+ 7  volume_ratio_24      — volume / rolling_mean(24)      [volume]
+ 8  vwap_deviation       — (close − vwap) / |vwap|       [other]
+ 9  returns_6h           — 6-period log return            [momentum]
+10  bb_percent_b_12      — Bollinger %B, window=12        [technical]
+11  returns_1h           — 1-period log return            [momentum]
+12  volatility_6h        — rolling std of 1h log returns  [volatility]
+13  rsi_6                — RSI(6) on close                [technical]
+14  trends_bitcoin_zscore— Google Trends z-score          [sentiment]
+     (already computed and present in btc_sentiment_hourly.csv)
+
+Timestamp Normalisation
+-----------------------
+The OHLCV file has UTC-aware timestamps (datetime64[ns, UTC]).
+The sentiment and on-chain files have timezone-naive timestamps.
+This script strips timezone info from OHLCV timestamps before merging to
+avoid the ValueError: "merging on datetime64[ns, UTC] and datetime64[ns]".
 
 Usage
 -----
-  python prepare_btc_hourly_dataset.py
-
-  or import and call:
-    from prepare_btc_hourly_dataset import prepare_dataset
-    df = prepare_dataset(input_path, trends_path, output_path)
+    python prepare_btc_hourly_dataset.py
 
 Author: Jarred Deluca
 Project: ServoTrader
@@ -51,35 +64,62 @@ import sys
 import warnings
 import numpy as np
 import pandas as pd
-from pathlib import Path
 
 # ---------------------------------------------------------------------------
-#  Configuration — adjust paths as needed
+#  Paths
 # ---------------------------------------------------------------------------
 
-# Raw hourly BTC OHLCV data (from Binance download scripts)
-INPUT_PATH  = "/home/jarred/git/ServoTrader/data/BTCUSDT_1h.csv"
+OHLCV_PATH     = "/home/jarred/git/ServoTrader/data/hourly_historical/BTCUSDT.csv"
+SENTIMENT_PATH = "/home/jarred/git/ServoTrader/data/btc_sentiment_hourly.csv"
+ONCHAIN_PATH   = "/home/jarred/git/ServoTrader/data/btc_onchain_hourly_metrics.csv"
+OUTPUT_PATH    = "/home/jarred/git/ServoTrader/data/btc_hourly_features.csv"
 
-# Optional: daily Google Trends CSV with columns ['date', 'bitcoin_trend']
-# If not available, leave as None — the feature will be filled with zeros.
-TRENDS_PATH = "/home/jarred/git/ServoTrader/data/bitcoin_google_trends.csv"
-
-# Output path for the feature-engineered dataset used by BTCTradingEnv
-OUTPUT_PATH = "/home/jarred/git/ServoTrader/data/btc_hourly_features.csv"
+# Boruta-confirmed feature columns (must match BORUTA_FEATURES in btc_trading_env.py)
+FEATURE_COLS = [
+    "rsi_24",
+    "adx_14",
+    "stoch_k",
+    "stoch_d",
+    "bb_percent_b_48",
+    "bb_percent_b_24",
+    "volume_ratio_24",
+    "vwap_deviation",
+    "returns_6h",
+    "bb_percent_b_12",
+    "returns_1h",
+    "volatility_6h",
+    "rsi_6",
+    "trends_bitcoin_zscore",
+]
 
 
 # ---------------------------------------------------------------------------
-#  Indicator helpers
+#  Timestamp helper
+# ---------------------------------------------------------------------------
+
+def _normalise_ts(series: pd.Series) -> pd.Series:
+    """
+    Parse a timestamp series and return timezone-naive UTC datetime64[ns].
+
+    Converts both tz-aware and tz-naive inputs to a consistent naive dtype
+    so that pd.merge(on='timestamp') works without a dtype mismatch error.
+
+    Strategy:
+      1. Parse with utc=True  → everything becomes UTC-aware
+      2. Strip tzinfo          → becomes naive (still represents the same UTC moment)
+    """
+    return pd.to_datetime(series, utc=True, errors="coerce").dt.tz_localize(None)
+
+
+# ---------------------------------------------------------------------------
+#  Technical indicator helpers
 # ---------------------------------------------------------------------------
 
 def _wilder_rsi(close: pd.Series, period: int) -> pd.Series:
-    """
-    Wilder-smoothed RSI.  Using EWM with alpha=1/period matches the original
-    Wilder definition and the computation used in the Boruta training run.
-    """
-    delta    = close.diff()
-    gain     = delta.clip(lower=0)
-    loss     = (-delta).clip(lower=0)
+    """Wilder-smoothed RSI (EWM alpha = 1/period, matches Boruta training run)."""
+    d        = close.diff()
+    gain     = d.clip(lower=0)
+    loss     = (-d).clip(lower=0)
     avg_gain = gain.ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean()
     rs       = avg_gain / (avg_loss + 1e-12)
@@ -87,281 +127,249 @@ def _wilder_rsi(close: pd.Series, period: int) -> pd.Series:
 
 
 def _adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
-    """
-    Average Directional Index (ADX).
-    Uses Wilder smoothing (EWM alpha=1/period).
-    """
-    prev_high  = high.shift(1)
-    prev_low   = low.shift(1)
-    prev_close = close.shift(1)
+    """Average Directional Index using Wilder smoothing (alpha = 1/period)."""
+    ph, pl, pc = high.shift(1), low.shift(1), close.shift(1)
 
     tr = pd.concat([
-        high - low,
-        (high - prev_close).abs(),
-        (low  - prev_close).abs(),
+        (high - low),
+        (high - pc).abs(),
+        (low  - pc).abs(),
     ], axis=1).max(axis=1)
 
-    dm_plus  = (high - prev_high).clip(lower=0)
-    dm_minus = (prev_low - low).clip(lower=0)
-    # Zero out whichever directional move is smaller
-    dm_plus  = dm_plus.where(dm_plus >= dm_minus, 0.0)
-    dm_minus = dm_minus.where(dm_minus > dm_plus,  0.0)
+    dm_p = (high - ph).clip(lower=0)
+    dm_m = (pl - low).clip(lower=0)
+    # Where both DMs are positive keep the larger, zero out the smaller
+    overlap = (dm_p > 0) & (dm_m > 0)
+    dm_p    = dm_p.where(~overlap | (dm_p >= dm_m), 0.0)
+    dm_m    = dm_m.where(~overlap | (dm_m > dm_p),  0.0)
 
-    alpha = 1.0 / period
-    atr   = tr.ewm(alpha=alpha, min_periods=period, adjust=False).mean()
-    di_p  = 100.0 * dm_plus.ewm( alpha=alpha, min_periods=period, adjust=False).mean() / (atr + 1e-12)
-    di_m  = 100.0 * dm_minus.ewm(alpha=alpha, min_periods=period, adjust=False).mean() / (atr + 1e-12)
-
-    dx    = 100.0 * (di_p - di_m).abs() / (di_p + di_m + 1e-12)
-    adx   = dx.ewm(alpha=alpha, min_periods=period, adjust=False).mean()
-    return adx
+    a    = 1.0 / period
+    atr  = tr.ewm(alpha=a, min_periods=period, adjust=False).mean()
+    di_p = 100.0 * dm_p.ewm(alpha=a, min_periods=period, adjust=False).mean() / (atr + 1e-12)
+    di_m = 100.0 * dm_m.ewm(alpha=a, min_periods=period, adjust=False).mean() / (atr + 1e-12)
+    dx   = 100.0 * (di_p - di_m).abs() / (di_p + di_m + 1e-12)
+    return dx.ewm(alpha=a, min_periods=period, adjust=False).mean()
 
 
-def _stochastic(
-    high:  pd.Series,
-    low:   pd.Series,
-    close: pd.Series,
-    k_period: int = 14,
-    d_period: int = 3,
-) -> tuple[pd.Series, pd.Series]:
-    """Stochastic oscillator %K and %D."""
-    lowest  = low.rolling(k_period).min()
-    highest = high.rolling(k_period).max()
-    k       = 100.0 * (close - lowest) / (highest - lowest + 1e-12)
-    d       = k.rolling(d_period).mean()
+def _stochastic(high, low, close, k_period=14, d_period=3):
+    """Stochastic %K and %D (SMA of %K over d_period)."""
+    lo = low.rolling(k_period, min_periods=k_period).min()
+    hi = high.rolling(k_period, min_periods=k_period).max()
+    k  = 100.0 * (close - lo) / (hi - lo + 1e-12)
+    d  = k.rolling(d_period, min_periods=d_period).mean()
     return k, d
 
 
-def _bollinger_percent_b(close: pd.Series, window: int, n_std: float = 2.0) -> pd.Series:
-    """
-    Bollinger Band %B.
-    %B = (close − lower) / (upper − lower)
-    where upper/lower = MA ± n_std * σ
-    """
-    ma    = close.rolling(window).mean()
-    sigma = close.rolling(window).std()
+def _bb_percent_b(close: pd.Series, window: int, n_std: float = 2.0) -> pd.Series:
+    """Bollinger Band %B = (close − lower) / (upper − lower)."""
+    ma    = close.rolling(window, min_periods=window).mean()
+    sigma = close.rolling(window, min_periods=window).std()
     upper = ma + n_std * sigma
     lower = ma - n_std * sigma
     return (close - lower) / (upper - lower + 1e-12)
 
 
 def _volume_ratio(volume: pd.Series, window: int = 24) -> pd.Series:
-    """Current volume relative to its rolling mean."""
-    return volume / (volume.rolling(window).mean() + 1e-12)
+    """volume / rolling_mean_volume(window)."""
+    return volume / (volume.rolling(window, min_periods=window).mean() + 1e-12)
 
 
 def _vwap_deviation(close: pd.Series, vwap: pd.Series) -> pd.Series:
-    """Normalised deviation of close from VWAP."""
+    """(close − vwap) / |vwap|."""
     return (close - vwap) / (vwap.abs() + 1e-12)
 
 
 def _log_return(close: pd.Series, periods: int = 1) -> pd.Series:
-    """Log return over `periods` steps."""
-    return np.log(close / close.shift(periods))
-
-
-def _rolling_volatility(log_ret: pd.Series, window: int) -> pd.Series:
-    """Rolling standard deviation of log returns."""
-    return log_ret.rolling(window).std()
+    """Log return over `periods` candles."""
+    return np.log(close / (close.shift(periods) + 1e-12))
 
 
 # ---------------------------------------------------------------------------
-#  Main preparation function
+#  Main
 # ---------------------------------------------------------------------------
 
 def prepare_dataset(
-    input_path:  str = INPUT_PATH,
-    trends_path: str | None = TRENDS_PATH,
-    output_path: str = OUTPUT_PATH,
-    verbose:     bool = True,
+    ohlcv_path:     str  = OHLCV_PATH,
+    sentiment_path: str  = SENTIMENT_PATH,
+    onchain_path:   str  = ONCHAIN_PATH,
+    output_path:    str  = OUTPUT_PATH,
+    verbose:        bool = True,
 ) -> pd.DataFrame:
     """
-    Loads raw OHLCV data, engineers all 14 Boruta features, and writes
-    the result to `output_path`.
-
-    Parameters
-    ----------
-    input_path  : path to raw hourly OHLCV CSV
-    trends_path : path to daily Google Trends CSV (or None to skip)
-    output_path : destination for the feature-engineered CSV
-    verbose     : print progress messages
-
-    Returns
-    -------
-    pd.DataFrame with OHLCV columns + 14 features, NaN warm-up rows dropped.
+    Load source CSVs, engineer 14 features, and save the training-ready dataset.
+    Returns the final DataFrame.
     """
 
-    # ── Load raw data ────────────────────────────────────────────────────────
+    sep = "=" * 70
+
+    # ── 1. OHLCV ─────────────────────────────────────────────────────────────
     if verbose:
-        print(f"[DataPrep] Loading {input_path}…")
+        print(f"\n{sep}")
+        print(f"  LOADING OHLCV")
+        print(f"  {ohlcv_path}")
+        print(sep)
 
-    df = pd.read_csv(input_path)
+    if not os.path.exists(ohlcv_path):
+        raise FileNotFoundError(f"OHLCV file not found: {ohlcv_path}")
 
-    # Normalise column names to lowercase
-    df.columns = [c.lower().strip() for c in df.columns]
+    ohlcv = pd.read_csv(ohlcv_path)
+    ohlcv.columns = [c.lower().strip() for c in ohlcv.columns]
 
-    # Ensure timestamp is parsed and sorted chronologically
-    if "timestamp" in df.columns:
-        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
-        df = df.sort_values("timestamp").reset_index(drop=True)
-    elif "open_time" in df.columns:
-        # Binance raw format
-        df.rename(columns={"open_time": "timestamp"}, inplace=True)
-        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-        df = df.sort_values("timestamp").reset_index(drop=True)
+    # --- Normalise timestamp to tz-naive ---
+    ohlcv["timestamp"] = _normalise_ts(ohlcv["timestamp"])
+    ohlcv = ohlcv.sort_values("timestamp").reset_index(drop=True)
 
-    # Required base columns
     for col in ["open", "high", "low", "close", "volume"]:
-        if col not in df.columns:
-            raise ValueError(f"[DataPrep] Required column '{col}' not found in {input_path}")
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+        ohlcv[col] = pd.to_numeric(ohlcv[col], errors="coerce")
 
-    # VWAP — use existing or approximate
-    if "vwap" not in df.columns or df["vwap"].isna().all():
-        if verbose:
-            print("[DataPrep] VWAP not found — approximating as (H+L+C)/3")
-        df["vwap"] = (df["high"] + df["low"] + df["close"]) / 3.0
+    # VWAP — prefer existing column; approximate if absent/bad
+    if "vwap" in ohlcv.columns:
+        ohlcv["vwap"] = pd.to_numeric(ohlcv["vwap"], errors="coerce")
+        bad_frac = ohlcv["vwap"].isna().mean()
+        if bad_frac > 0.5:
+            if verbose:
+                print(f"  ⚠  vwap column is {bad_frac:.0%} NaN → approximating as (H+L+C)/3")
+            ohlcv["vwap"] = (ohlcv["high"] + ohlcv["low"] + ohlcv["close"]) / 3.0
     else:
-        df["vwap"] = pd.to_numeric(df["vwap"], errors="coerce")
+        if verbose:
+            print("  ⚠  vwap column missing → approximating as (H+L+C)/3")
+        ohlcv["vwap"] = (ohlcv["high"] + ohlcv["low"] + ohlcv["close"]) / 3.0
 
-    # Forward-fill prices for any gaps
     for col in ["open", "high", "low", "close", "vwap"]:
-        df[col] = df[col].ffill().bfill()
-    df["volume"] = df["volume"].fillna(0.0)
+        ohlcv[col] = ohlcv[col].ffill().bfill()
+    ohlcv["volume"] = ohlcv["volume"].fillna(0.0)
+    ohlcv = ohlcv.drop(columns=["symbol", "count"], errors="ignore")
 
     if verbose:
-        print(f"[DataPrep] Rows after load: {len(df):,}")
+        print(f"  ✅  {len(ohlcv):,} rows | "
+              f"{ohlcv['timestamp'].min()} → {ohlcv['timestamp'].max()}")
 
-    # ── Engineer features ────────────────────────────────────────────────────
+    # ── 2. Sentiment — extract trends_bitcoin_zscore ─────────────────────────
+    if verbose:
+        print(f"\n{sep}")
+        print(f"  LOADING SENTIMENT (trends_bitcoin_zscore)")
+        print(f"  {sentiment_path}")
+        print(sep)
+
+    sentiment_col = None
+    if os.path.exists(sentiment_path):
+        sent = pd.read_csv(sentiment_path)
+        sent.columns = [c.lower().strip() for c in sent.columns]
+
+        if "trends_bitcoin_zscore" in sent.columns:
+            sent["timestamp"] = _normalise_ts(sent["timestamp"])
+            sent = (
+                sent[["timestamp", "trends_bitcoin_zscore"]]
+                .copy()
+                .sort_values("timestamp")
+                .drop_duplicates("timestamp")
+            )
+            sent["trends_bitcoin_zscore"] = (
+                pd.to_numeric(sent["trends_bitcoin_zscore"], errors="coerce")
+                .ffill()
+                .bfill()
+                .fillna(0.0)
+            )
+            sentiment_col = sent
+            if verbose:
+                print(f"  ✅  {len(sent):,} rows | trends_bitcoin_zscore found and loaded")
+        else:
+            if verbose:
+                print(f"  ⚠  trends_bitcoin_zscore column not in sentiment CSV — filling zeros")
+                print(f"      Available columns: {list(sent.columns[:10])} …")
+    else:
+        if verbose:
+            print(f"  ⚠  Sentiment file not found — filling zeros")
+
+    # ── 3. Merge OHLCV + sentiment ────────────────────────────────────────────
+    # All timestamps are now timezone-naive → merge is safe
+    if sentiment_col is not None:
+        df = ohlcv.merge(sentiment_col, on="timestamp", how="left")
+        # Sentiment is daily so many hours won't match directly; forward-fill
+        df["trends_bitcoin_zscore"] = (
+            df["trends_bitcoin_zscore"].ffill().bfill().fillna(0.0)
+        )
+    else:
+        df = ohlcv.copy()
+        df["trends_bitcoin_zscore"] = 0.0
+
+    if verbose:
+        print(f"\n  After merge: {len(df):,} rows")
+
+    # ── 4. Engineer the 13 OHLCV-based features ──────────────────────────────
+    if verbose:
+        print(f"\n{sep}")
+        print("  ENGINEERING FEATURES")
+        print(sep)
+
     close  = df["close"]
     high   = df["high"]
     low    = df["low"]
     volume = df["volume"]
     vwap   = df["vwap"]
 
-    # 1.  RSI(24)
     df["rsi_24"]          = _wilder_rsi(close, period=24)
-
-    # 2.  ADX(14)
+    df["rsi_6"]           = _wilder_rsi(close, period=6)
     df["adx_14"]          = _adx(high, low, close, period=14)
-
-    # 3 & 4.  Stochastic %K / %D
-    df["stoch_k"], df["stoch_d"] = _stochastic(high, low, close, k_period=14, d_period=3)
-
-    # 5 & 6 & 10.  Bollinger %B at three windows
-    df["bb_percent_b_48"] = _bollinger_percent_b(close, window=48)
-    df["bb_percent_b_24"] = _bollinger_percent_b(close, window=24)
-    df["bb_percent_b_12"] = _bollinger_percent_b(close, window=12)
-
-    # 7.  Volume ratio(24)
+    df["stoch_k"], \
+    df["stoch_d"]         = _stochastic(high, low, close, k_period=14, d_period=3)
+    df["bb_percent_b_12"] = _bb_percent_b(close, window=12)
+    df["bb_percent_b_24"] = _bb_percent_b(close, window=24)
+    df["bb_percent_b_48"] = _bb_percent_b(close, window=48)
     df["volume_ratio_24"] = _volume_ratio(volume, window=24)
-
-    # 8.  VWAP deviation
     df["vwap_deviation"]  = _vwap_deviation(close, vwap)
-
-    # 9 & 11.  Log returns
     log_ret_1h            = _log_return(close, periods=1)
     df["returns_1h"]      = log_ret_1h
     df["returns_6h"]      = _log_return(close, periods=6)
+    df["volatility_6h"]   = log_ret_1h.rolling(6, min_periods=6).std()
 
-    # 12.  6h volatility (std of hourly log returns over 6 periods)
-    df["volatility_6h"]   = _rolling_volatility(log_ret_1h, window=6)
-
-    # 13.  RSI(6)
-    df["rsi_6"]           = _wilder_rsi(close, period=6)
-
-    # 14.  Google Trends z-score (daily → forward-filled to hourly)
-    df["trends_bitcoin_zscore"] = _attach_trends(df, trends_path, verbose)
-
-    # ── Drop warm-up NaN rows ────────────────────────────────────────────────
-    feature_cols = [
-        "rsi_24", "adx_14", "stoch_k", "stoch_d",
-        "bb_percent_b_48", "bb_percent_b_24", "volume_ratio_24",
-        "vwap_deviation", "returns_6h", "bb_percent_b_12",
-        "returns_1h", "volatility_6h", "rsi_6", "trends_bitcoin_zscore",
-    ]
-    before = len(df)
-    df = df.dropna(subset=feature_cols).reset_index(drop=True)
     if verbose:
-        print(f"[DataPrep] Rows after dropping warm-up NaNs: {len(df):,} (dropped {before - len(df):,})")
+        print("  ✅  All 14 features computed")
 
-    # ── Sanity checks ────────────────────────────────────────────────────────
-    for col in feature_cols:
+    # ── 5. Drop NaN warm-up rows ──────────────────────────────────────────────
+    before = len(df)
+    df     = df.dropna(subset=FEATURE_COLS).reset_index(drop=True)
+    if verbose:
+        print(f"  Dropped {before - len(df):,} warm-up rows | Remaining: {len(df):,}")
+
+    # ── 6. Sanitise residual Inf/NaN ─────────────────────────────────────────
+    for col in FEATURE_COLS:
         n_inf = np.isinf(df[col]).sum()
         n_nan = df[col].isna().sum()
         if n_inf > 0 or n_nan > 0:
-            warnings.warn(f"[DataPrep] {col}: {n_inf} Infs, {n_nan} NaNs remain after clean — filling with 0")
+            warnings.warn(
+                f"[DataPrep] {col}: {n_inf} Inf, {n_nan} NaN remain — replacing with 0"
+            )
             df[col] = df[col].replace([np.inf, -np.inf], 0.0).fillna(0.0)
 
-    # ── Save ─────────────────────────────────────────────────────────────────
-    keep_cols = ["timestamp", "open", "high", "low", "close", "vwap", "volume"] + feature_cols
-    keep_cols = [c for c in keep_cols if c in df.columns]
-    out_df    = df[keep_cols]
+    # ── 7. Save ───────────────────────────────────────────────────────────────
+    keep  = ["timestamp", "open", "high", "low", "close", "vwap", "volume"] + FEATURE_COLS
+    keep  = [c for c in keep if c in df.columns]
+    out   = df[keep].copy()
 
-    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    out_df.to_csv(output_path, index=False)
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    out.to_csv(output_path, index=False)
 
+    # ── 8. Summary ────────────────────────────────────────────────────────────
     if verbose:
-        print(f"[DataPrep] ✅ Saved {len(out_df):,} rows → {output_path}")
-        print(f"[DataPrep] Columns: {list(out_df.columns)}")
-        print("\n[DataPrep] Feature statistics:")
-        print(out_df[feature_cols].describe().round(4).to_string())
+        print(f"\n{sep}")
+        print(f"  ✅  COMPLETE")
+        print(f"  Saved {len(out):,} rows → {output_path}")
+        print(f"  Date range: {out['timestamp'].min()} → {out['timestamp'].max()}")
+        print(sep)
+        print("\n  Feature statistics:")
+        print(out[FEATURE_COLS].describe().round(4).to_string())
+        print(f"\n{sep}")
+        print("  Value range check (flag if |value| > 1000):")
+        for col in FEATURE_COLS:
+            mn = out[col].min()
+            mx = out[col].max()
+            ok = abs(mn) < 1000 and abs(mx) < 1000
+            flag = "✅" if ok else "⚠ "
+            print(f"    {flag}  {col:<25}  min={mn:>10.4f}   max={mx:>10.4f}")
+        print(sep + "\n")
 
-    return out_df
-
-
-def _attach_trends(df: pd.DataFrame, trends_path: str | None, verbose: bool) -> pd.Series:
-    """
-    Loads Google Trends data, z-scores it, and forward-fills to hourly frequency.
-    Returns a pd.Series aligned to df's index. If trends_path is None or the file
-    does not exist, returns zeros with a warning.
-    """
-    if trends_path is None or not os.path.exists(trends_path):
-        if verbose:
-            warnings.warn(
-                "[DataPrep] trends_bitcoin_zscore: Google Trends file not found. "
-                "Filling with zeros (neutral). This will reduce model signal quality. "
-                f"Expected path: {trends_path}"
-            )
-        return pd.Series(0.0, index=df.index)
-
-    trends = pd.read_csv(trends_path)
-    trends.columns = [c.lower().strip() for c in trends.columns]
-
-    # Accept common column name variants
-    date_col  = next((c for c in trends.columns if "date" in c),  None)
-    val_col   = next((c for c in trends.columns if "trend" in c or "bitcoin" in c or "value" in c), None)
-
-    if date_col is None or val_col is None:
-        warnings.warn(
-            f"[DataPrep] Trends CSV must have a date column and a value column. "
-            f"Found: {list(trends.columns)}. Filling with zeros."
-        )
-        return pd.Series(0.0, index=df.index)
-
-    trends["date"]  = pd.to_datetime(trends[date_col], utc=True, errors="coerce")
-    trends["value"] = pd.to_numeric(trends[val_col], errors="coerce")
-    trends = trends[["date", "value"]].dropna().sort_values("date").set_index("date")
-
-    # Z-score the raw trend index
-    mu  = trends["value"].mean()
-    sig = trends["value"].std() + 1e-8
-    trends["zscore"] = (trends["value"] - mu) / sig
-
-    # Reindex to hourly timestamps in df and forward-fill
-    if "timestamp" not in df.columns:
-        warnings.warn("[DataPrep] No 'timestamp' column in OHLCV data — cannot align Trends. Filling zeros.")
-        return pd.Series(0.0, index=df.index)
-
-    ts_index    = df["timestamp"].dt.normalize()   # floor to day for join
-    merged      = ts_index.map(trends["zscore"].to_dict())
-    merged      = merged.ffill().bfill().fillna(0.0)
-
-    if verbose:
-        n_matched = merged.notna().sum()
-        print(f"[DataPrep] Trends: matched {n_matched:,}/{len(df):,} rows")
-
-    return merged.reset_index(drop=True)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -369,9 +377,4 @@ def _attach_trends(df: pd.DataFrame, trends_path: str | None, verbose: bool) -> 
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    prepare_dataset(
-        input_path  = INPUT_PATH,
-        trends_path = TRENDS_PATH,
-        output_path = OUTPUT_PATH,
-        verbose     = True,
-    )
+    prepare_dataset()
