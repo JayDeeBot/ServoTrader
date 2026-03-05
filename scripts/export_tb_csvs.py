@@ -16,16 +16,16 @@ Output format (matches TensorBoard manual export exactly)
 Usage
 -----
     # Export latest run (default)
-    python export_tb_csvs.py
+    python3 scripts/ export_tb_csvs.py
 
     # Export a specific run directory
-    python export_tb_csvs.py --logdir /home/jarred/git/ServoTrader/logs/tb/run_20240101_120000
+    python3 scripts/export_tb_csvs.py --logdir /home/jarred/git/ServoTrader/logs/tb/events.out.tfevents.1772588878.jarred-GF62-7RD.16691.0
 
     # Change output directory
-    python export_tb_csvs.py --outdir /tmp/tb_export
+    python3 scripts/ export_tb_csvs.py --outdir /tmp/tb_export
 
     # Export only specific tags (comma-separated, supports wildcards)
-    python export_tb_csvs.py --tags "rollout/*,train/entropy"
+    python3 scripts/ export_tb_csvs.py --tags "rollout/*,train/entropy"
 
 Author: Jarred Deluca
 Project: ServoTrader

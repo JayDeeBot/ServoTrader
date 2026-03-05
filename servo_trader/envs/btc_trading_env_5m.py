@@ -21,9 +21,11 @@ Episode Structure
 
 Reward Shaping
 --------------
-  NOT_BUY : retrospective shaping — +0.001 if avoided a losing entry
-            (hypothetical return over next min_hold_steps < 0), else -0.0001
-  BUY     : 0.0
+  NOT_BUY : -0.0001 per step (fixed wait cost — never accumulates above
+            ~0.003 for a typical pre-trade wait, same order as trading cost)
+  BUY     : entry quality penalty — if forward return over min_hold_steps < 0,
+            applies proportional penalty capped at -TRADE_COST (0.003).
+            Zero reward for good entries.
   HOLD    : Δ unrealized PnL (mark-to-market per step)
   SELL    : realized_pnl − 0.003
 
@@ -151,14 +153,16 @@ class BTCTradingEnv5m(gym.Env):
         self.observation_space = spaces.Box(low=low, high=high, dtype=np.float32)
 
         # State
-        self.current_step     : int   = 0
-        self.in_position      : bool  = False
-        self.buy_price        : float = 0.0
-        self.prev_price       : float = 0.0
-        self.steps_in_trade   : int   = 0
-        self.episode_start    : int   = 0
-        self._buy_step        : Optional[int]   = None
-        self._buy_price       : float = 0.0
+        self.current_step      : int   = 0
+        self.in_position       : bool  = False
+        self.buy_price         : float = 0.0
+        self.prev_price        : float = 0.0
+        self.steps_in_trade    : int   = 0
+        self.episode_start     : int   = 0
+        self.episode_steps     : int   = 0   # explicit counter — avoids wrap-around bug
+        self.episode_not_buys  : int   = 0   # tracks NOT_BUY decisions per episode
+        self._buy_step         : Optional[int]   = None
+        self._buy_price        : float = 0.0
 
         # Logging
         self.log_dir          = log_dir
@@ -188,14 +192,16 @@ class BTCTradingEnv5m(gym.Env):
         if max_start <= min_start:
             max_start = min_start + 1
 
-        self.current_step  = int(self.np_random.integers(min_start, max_start))
-        self.episode_start = self.current_step
-        self.in_position   = False
-        self.buy_price     = 0.0
-        self.prev_price    = self.close_prices[self.current_step]
+        self.current_step   = int(self.np_random.integers(min_start, max_start))
+        self.episode_start  = self.current_step
+        self.in_position    = False
+        self.buy_price      = 0.0
+        self.prev_price     = self.close_prices[self.current_step]
         self.steps_in_trade = 0
-        self._buy_step     = None
-        self._buy_price    = 0.0
+        self.episode_steps  = 0   # reset explicit step counter
+        self.episode_not_buys = 0  # reset NOT_BUY counter
+        self._buy_step      = None
+        self._buy_price     = 0.0
 
         self.episode_log = [{
             "type":       "episode_start",
@@ -220,36 +226,39 @@ class BTCTradingEnv5m(gym.Env):
             if self.in_position:
                 reward = -0.01   # illegal in Phase 2
             else:
-                # Retrospective shaping: peek at what would have happened if
-                # the agent had bought right now and held for min_hold_steps.
-                # - If that hypothetical trade would have lost → small positive
-                #   reward for correctly staying out.
-                # - If it would have gained → tiny cost for missing the entry.
-                #
-                # Asymmetric magnitudes are intentional: reward avoiding bad
-                # entries clearly (+0.001) but barely penalise missing good
-                # ones (-0.0001). We don't want the agent to feel pressured to
-                # buy on every candle — just to learn that some entries are
-                # clearly worth skipping.
-                future_idx    = min(self.current_step + self.min_hold_steps, self.n_rows - 1)
-                future_price  = self.close_prices[future_idx]
-                hypothetical  = (future_price / max(current_price, 1e-12)) - 1.0
-                if hypothetical < 0:
-                    reward = 0.001    # correctly avoided a losing entry
-                else:
-                    reward = -0.0001  # missed a winning entry (small cost only)
+                # Small fixed wait cost — always negative so it never accumulates
+                # into a dominant positive signal. Scale is 1/30th of the trading
+                # cost (0.003), so even 90 consecutive NOT_BUY steps only
+                # accumulates 0.003 — equal to one trading cost, not 30x it.
+                reward = -0.0001
+                self.episode_not_buys += 1
+                self._log_step(action, "not_buy", current_price, 0.0, reward)
 
         elif action == ACTION_BUY:
             if self.in_position:
                 reward = -0.01
             else:
+                # Entry quality shaping: peek forward min_hold_steps candles.
+                # If buying into a declining market, apply a proportional penalty
+                # capped at the trading cost. This gives the agent a direct signal
+                # that some entries are worth skipping — complementing the NOT_BUY
+                # wait cost without creating runaway reward accumulation.
+                future_idx   = min(self.current_step + self.min_hold_steps, self.n_rows - 1)
+                future_price = self.close_prices[future_idx]
+                hypothetical = (future_price / max(current_price, 1e-12)) - 1.0
+                if hypothetical < 0:
+                    # Penalise bad entries proportionally, capped at trading cost
+                    entry_penalty = max(hypothetical, -TRADE_COST)
+                else:
+                    entry_penalty = 0.0
+
                 self.in_position    = True
                 self.buy_price      = current_price
                 self.steps_in_trade = 0
                 self._buy_step      = int(self.current_step)
                 self._buy_price     = current_price
-                reward              = 0.0
-                self._log_step(action, "buy", current_price, 0.0, 0.0)
+                reward              = entry_penalty
+                self._log_step(action, "buy", current_price, 0.0, reward)
 
         elif action == ACTION_HOLD:
             if not self.in_position:
@@ -369,7 +378,8 @@ class BTCTradingEnv5m(gym.Env):
         return profit_pct, reward
 
     def _advance_step(self):
-        self.current_step += 1
+        self.episode_steps += 1
+        self.current_step  += 1
         if self.current_step >= self.n_rows:
             self.current_step = HISTORY_WINDOW
 
@@ -379,7 +389,8 @@ class BTCTradingEnv5m(gym.Env):
         summary = {
             "type":             "episode_end",
             "episode":          int(self.episode_counter),
-            "steps":            int(self.current_step - self.episode_start),
+            "steps":            int(self.episode_steps),      # explicit counter, never negative
+            "not_buy_steps":    int(self.episode_not_buys),   # Phase 1 wait steps this episode
             "buy_step":         self._buy_step,
             "buy_price":        float(self._buy_price) if self._buy_price else None,
             "profit_pct":       float(profit_pct),

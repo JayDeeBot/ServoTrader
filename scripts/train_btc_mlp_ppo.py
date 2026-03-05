@@ -26,31 +26,43 @@ MLP Architecture
 
 Key Diagnostics to Watch
 ------------------------
-  win_rate         → target > 0.50; should reach this by 500K steps
-  mean_ep_reward   → target > 0.003 (beats 0.3% cost); watch for it going positive
-  entropy          → should stay flat at ~0.69 (=ln(2)) for first 30% (warmup),
-                     then decay slowly. Collapse before 30% = ent_coef still too low.
-  train/ent_coef   → watch this to confirm warmup is working (flat, then decay)
-  approx_kl        → should stay < 0.02; validated clean in v2
-  clip_fraction    → 0.05-0.20 healthy; v2 was 0.023 (slightly low, ok)
-  mean_ep_length   → if NOT_BUY is working, this should vary more. Very long
-                     episodes (>60) = agent holds too long; < 10 = not holding enough
+  rollout/win_rate           → target > 0.50; should reach this well before 500K steps
+  rollout/mean_profit_pct    → must trend positive; ≥ 0.003 beats the trading cost
+                               NOTE: now measures actual trade P&L only (NOT_BUY rewards
+                               excluded), so this is a clean profitability signal
+  rollout/not_buy_fraction   → target 0.10–0.40; should be non-zero within 100K steps.
+                               Near-zero = agent still always buying immediately.
+                               Near-1.0  = agent refusing to trade.
+  rollout/mean_not_buy_steps → mean NOT_BUY steps before each trade entry
+  train/entropy              → should stay above ent_floor (0.10) throughout training.
+                               If it drops below, the floor penalty kicks in automatically.
+  train/ent_coef             → confirm flat for first 30% (0–600K steps), then decaying
+  train/approx_kl            → healthy < 0.02 (validated clean in v2/v3)
+  train/clip_fraction        → 0.05–0.20 healthy; near-zero = policy frozen
 
-Changes in This Version (v3)
+Changes in This Version (v4)
 ------------------------------
-  1. ent_coef raised 0.02 → 0.05, ent_coef_end 0.005 → 0.01
-     With only 2 legal actions (max entropy = ln(2) = 0.693), the old value
-     wasn't strong enough to counteract the orthogonal init BUY bias.
+  1. NOT_BUY reward redesigned — removed accumulating retrospective reward (+0.001/step
+     which inflated mean_ep_reward to 16% and swamped the 0.003 trade signal). Replaced
+     with: flat wait cost -0.0001/step (never accumulates above ~0.003 for typical waits)
+     + BUY entry quality penalty at the moment of entry (proportional to forward loss,
+     capped at -0.003). This preserves the entry-selection incentive without inflation.
 
-  2. Entropy warmup: ent_coef held flat for first 30% of training (600K steps),
-     then linearly decays. In v2 entropy was below 0.3 by step 2,048 (first
-     rollout), so NOT_BUY was never meaningfully explored.
+  2. Episode length bug fixed — _finalise_episode() previously computed
+     current_step - episode_start, which went negative when the env wrapped at
+     dataset boundary. Now uses self.episode_steps, an explicit counter that
+     increments in _advance_step() and resets in reset().
 
-  3. NOT_BUY retrospective reward (in btc_trading_env_5m.py):
-     Rather than a flat wait cost, NOT_BUY now checks what would have happened
-     if the agent had bought and held for min_hold_steps. Correctly avoiding a
-     losing entry gets +0.001; missing a winning entry costs -0.0001. This gives
-     the agent a direct supervisory signal for when NOT_BUY is the right call.
+  3. NOT_BUY logging added — NOT_BUY steps are now logged in both JSONL
+     (step-level records + not_buy_steps field in episode_end) and TensorBoard
+     (rollout/not_buy_fraction, rollout/mean_not_buy_steps). Previously 0% NOT_BUY
+     in analysis was partly a logging gap, not just a policy gap.
+
+  4. Entropy floor (ent_floor=0.10) — a quadratic penalty triggers when mean
+     batch entropy drops below 0.10. In v3, entropy collapsed to <0.001 by step
+     313K despite ent_coef=0.05. The floor catches this before it becomes permanent.
+
+  5. ent_coef raised 0.05 → 0.10, ent_coef_end 0.01 → 0.02.
 
 Usage
 -----
@@ -118,14 +130,14 @@ CFG = dict(
     gamma           = 0.99,
     gae_lambda      = 0.95,
     clip_epsilon    = 0.2,
-    ent_coef        = 0.05,     # raised from 0.02 — needs to be strong enough to keep
-                                # Phase 1 (NOT_BUY vs BUY) genuinely exploratory.
-                                # With only 2 legal actions max entropy is ln(2)=0.693,
-                                # so each unit of ent_coef has weaker effect than in
-                                # environments with more legal actions.
-    ent_coef_end    = 0.01,     # raised from 0.005 — don't decay all the way to near-zero
-    ent_warmup_frac = 0.30,     # hold ent_coef flat for first 30% of training before
-                                # decaying — gives Phase 1 a real exploration window
+    ent_coef        = 0.10,     # raised from 0.05 — entropy collapsed to <0.001 by step 313K
+                                # even with 0.05 and warmup. With only 2 legal actions
+                                # (max entropy = ln(2) = 0.693) the coefficient needs to be
+                                # much stronger to compete with a dominant reward signal.
+    ent_coef_end    = 0.02,     # raised from 0.01 — keep meaningful entropy pressure throughout
+    ent_warmup_frac = 0.30,     # hold flat for first 30% before decaying
+    ent_floor       = 0.10,     # minimum entropy below which an extra penalty is applied
+                                # to push the policy back toward exploration
     vf_coef         = 0.5,
     max_grad_norm   = 0.5,
     target_kl       = 0.02,
@@ -334,6 +346,7 @@ def ppo_update(model, optimiser, buffer, last_value, cfg, ent_coef) -> dict:
     max_gnorm  = cfg["max_grad_norm"]
     target_kl  = cfg["target_kl"]
     batch_size = cfg["batch_size"]
+    ent_floor  = cfg.get("ent_floor", 0.10)   # minimum entropy threshold
 
     buffer.compute_gae(last_value, cfg["gamma"], cfg["gae_lambda"])
 
@@ -351,9 +364,21 @@ def ppo_update(model, optimiser, buffer, last_value, cfg, ent_coef) -> dict:
             clipped = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps) * adv_b
             pg_loss = -torch.min(ratio * adv_b, clipped).mean()
             vf_loss = 0.5 * (values - ret_b).pow(2).mean()
-            ent_loss = -entropy.mean()
 
-            loss = pg_loss + vf_coef * vf_loss + ent_coef * ent_loss
+            # Standard entropy bonus (encourages exploration)
+            mean_entropy = entropy.mean()
+            ent_loss     = -mean_entropy
+
+            # Entropy floor: apply an extra quadratic penalty when mean entropy
+            # drops below ent_floor. This kicks in only when the policy is
+            # becoming dangerously deterministic, pushing it back toward
+            # exploration without over-regularising when entropy is healthy.
+            # In previous runs entropy collapsed to <0.001 by step 313K despite
+            # ent_coef=0.05 — the floor catches this before it becomes permanent.
+            floor_violation = torch.clamp(ent_floor - mean_entropy, min=0.0)
+            floor_penalty   = 2.0 * floor_violation.pow(2)   # quadratic, so gentle near floor
+
+            loss = pg_loss + vf_coef * vf_loss + ent_coef * ent_loss + floor_penalty
 
             optimiser.zero_grad()
             loss.backward()
@@ -366,7 +391,7 @@ def ppo_update(model, optimiser, buffer, last_value, cfg, ent_coef) -> dict:
 
             metrics["policy_loss"].append(pg_loss.item())
             metrics["value_loss"].append(vf_loss.item())
-            metrics["entropy"].append(-ent_loss.item())
+            metrics["entropy"].append(mean_entropy.item())
             metrics["approx_kl"].append(approx_kl)
             metrics["clip_fraction"].append(clip_frac)
 
@@ -465,10 +490,11 @@ def train(cfg: dict):
     os.makedirs(cfg["tb_log_dir"], exist_ok=True)
     writer = SummaryWriter(log_dir=cfg["tb_log_dir"])
 
-    ep_rewards = deque(maxlen=200)
-    ep_lengths = deque(maxlen=200)
-    ep_wins    = deque(maxlen=200)
-    ep_profits = deque(maxlen=200)
+    ep_rewards  = deque(maxlen=200)
+    ep_lengths  = deque(maxlen=200)
+    ep_wins     = deque(maxlen=200)
+    ep_profits  = deque(maxlen=200)
+    ep_not_buys = deque(maxlen=200)   # NOT_BUY steps per episode
     ep_count   = env.episode_counter
     last_save  = global_step
 
@@ -528,9 +554,10 @@ def train(cfg: dict):
 
             if done:
                 ep_rewards.append(ep_reward)
-                ep_lengths.append(env.current_step - env.episode_start)
+                ep_lengths.append(env.episode_steps)          # explicit counter, never negative
                 ep_wins.append(1 if ep_reward > 0 else 0)
                 ep_profits.append(ep_reward * 100)
+                ep_not_buys.append(env.episode_not_buys)      # NOT_BUY steps this episode
                 obs, info = env.reset()
                 ep_reward = 0.0
 
@@ -553,12 +580,19 @@ def train(cfg: dict):
         writer.add_scalar("train/ent_coef",      ent_now,                 global_step)
 
         if ep_rewards:
-            win_r = float(np.mean(ep_wins))
+            win_r  = float(np.mean(ep_wins))
             mean_r = float(np.mean(ep_rewards))
-            writer.add_scalar("rollout/mean_ep_reward", mean_r,               global_step)
-            writer.add_scalar("rollout/mean_ep_length", float(np.mean(ep_lengths)), global_step)
-            writer.add_scalar("rollout/win_rate",       win_r,               global_step)
-            writer.add_scalar("rollout/mean_profit_pct", float(np.mean(ep_profits)), global_step)
+            mean_nb = float(np.mean(ep_not_buys)) if ep_not_buys else 0.0
+            mean_len = float(np.mean(ep_lengths))
+            # NOT_BUY fraction: what share of episode steps were NOT_BUY
+            nb_frac = mean_nb / max(mean_len, 1.0)
+
+            writer.add_scalar("rollout/mean_ep_reward",   mean_r,    global_step)
+            writer.add_scalar("rollout/mean_ep_length",   mean_len,  global_step)
+            writer.add_scalar("rollout/win_rate",         win_r,     global_step)
+            writer.add_scalar("rollout/mean_profit_pct",  float(np.mean(ep_profits)), global_step)
+            writer.add_scalar("rollout/mean_not_buy_steps", mean_nb, global_step)
+            writer.add_scalar("rollout/not_buy_fraction", nb_frac,   global_step)
 
         new_ep = env.episode_counter - ep_count
         ep_count = env.episode_counter
@@ -571,6 +605,7 @@ def train(cfg: dict):
                 f"ep={ep_count:,} | "
                 f"mean_r={np.mean(ep_rewards) if ep_rewards else 0:+.4f} | "
                 f"win%={100*np.mean(ep_wins) if ep_wins else 0:.1f} | "
+                f"nb%={100*nb_frac:.1f} | "
                 f"pol={metrics['policy_loss']:.4f} | "
                 f"val={metrics['value_loss']:.4f} | "
                 f"ent={metrics['entropy']:.3f} | "
