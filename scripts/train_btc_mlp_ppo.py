@@ -26,43 +26,35 @@ MLP Architecture
 
 Key Diagnostics to Watch
 ------------------------
-  rollout/win_rate           → target > 0.50; should reach this well before 500K steps
-  rollout/mean_profit_pct    → must trend positive; ≥ 0.003 beats the trading cost
-                               NOTE: now measures actual trade P&L only (NOT_BUY rewards
-                               excluded), so this is a clean profitability signal
-  rollout/not_buy_fraction   → target 0.10–0.40; should be non-zero within 100K steps.
-                               Near-zero = agent still always buying immediately.
-                               Near-1.0  = agent refusing to trade.
-  rollout/mean_not_buy_steps → mean NOT_BUY steps before each trade entry
-  train/entropy              → should stay above ent_floor (0.10) throughout training.
-                               If it drops below, the floor penalty kicks in automatically.
-  train/ent_coef             → confirm flat for first 30% (0–600K steps), then decaying
-  train/approx_kl            → healthy < 0.02 (validated clean in v2/v3)
+  rollout/win_rate           → target > 0.53 (breakeven); aim for 0.55+
+                               v4 peaked at 58% at step 1.94M — that is the floor to beat
+  rollout/mean_profit_pct    → must trend positive; any value > 0.003 beats trading cost
+  rollout/not_buy_fraction   → fraction of Phase 1 decisions (NOT_BUY / (NOT_BUY+BUY))
+                               target 0.20–0.60; near-zero = always buying immediately (bad)
+  rollout/mean_not_buy_steps → mean Phase 1 wait before each entry
+  train/entropy              → keep above ent_floor=0.10 throughout training
+  train/lr                   → cosine: starts 1e-4, stays higher longer, drops to 1e-5
+  train/approx_kl            → < 0.02; spikes above 0.05 indicate gradient instability
   train/clip_fraction        → 0.05–0.20 healthy; near-zero = policy frozen
 
-Changes in This Version (v4)
-------------------------------
-  1. NOT_BUY reward redesigned — removed accumulating retrospective reward (+0.001/step
-     which inflated mean_ep_reward to 16% and swamped the 0.003 trade signal). Replaced
-     with: flat wait cost -0.0001/step (never accumulates above ~0.003 for typical waits)
-     + BUY entry quality penalty at the moment of entry (proportional to forward loss,
-     capped at -0.003). This preserves the entry-selection incentive without inflation.
+Fix in This Version (v6 + not_buy logging fix)
+-----------------------------------------------
+  One-line fix to rollout/not_buy_fraction:
 
-  2. Episode length bug fixed — _finalise_episode() previously computed
-     current_step - episode_start, which went negative when the env wrapped at
-     dataset boundary. Now uses self.episode_steps, an explicit counter that
-     increments in _advance_step() and resets in reset().
+  BEFORE: nb_frac = mean_nb / max(mean_len, 1.0)
+    Divided NOT_BUY steps by total episode length, which includes all Phase 2
+    HOLD steps. This made the metric read ~8% when the agent was actually
+    declining to buy on ~52% of its Phase 1 decisions — a 44pp undercount.
 
-  3. NOT_BUY logging added — NOT_BUY steps are now logged in both JSONL
-     (step-level records + not_buy_steps field in episode_end) and TensorBoard
-     (rollout/not_buy_fraction, rollout/mean_not_buy_steps). Previously 0% NOT_BUY
-     in analysis was partly a logging gap, not just a policy gap.
+  AFTER:  nb_frac = mean_nb / max(mean_nb + 1.0, 1.0)
+    In a single-trade episode there are exactly (mean_nb NOT_BUY + 1 BUY)
+    Phase 1 decisions. Dividing by (mean_nb + 1) gives the true fraction of
+    entry-decision steps that are NOT_BUY.
 
-  4. Entropy floor (ent_floor=0.10) — a quadratic penalty triggers when mean
-     batch entropy drops below 0.10. In v3, entropy collapsed to <0.001 by step
-     313K despite ent_coef=0.05. The floor catches this before it becomes permanent.
-
-  5. ent_coef raised 0.05 → 0.10, ent_coef_end 0.01 → 0.02.
+  All other code is identical to the version that produced:
+    - 51% win rate at step 3.94M
+    - +0.028% mean profit at step 3.82M  (first ever positive profit)
+    - Q4 JSONL win rate 38.3%
 
 Usage
 -----
@@ -118,46 +110,51 @@ CFG = dict(
     model_name  = "btc_mlp_ppo",
 
     # ── Environment ──────────────────────────────────────────────────────────
-    max_hold_steps = 72,        # 6 hours at 5-min; tune to 36 (3h) or 144 (12h)
-    min_hold_steps = 6,         # Must hold ≥ 6 candles (30 min) before SELL is legal.
-                                # Prevents BUY→SELL-immediately degenerate policy.
+    # Single-trade episodes: one BUY/SELL cycle per episode. Reverted from
+    # v5's multi-trade windows because the 0.5% stop-loss made trading so
+    # costly that the agent rationally refused to trade (NOT_BUY rose to 56%).
+    max_hold_steps = 72,   # 6-hour forced exit ceiling
+    min_hold_steps = 6,    # 30-min minimum hold before SELL is legal.
+                           # Reverted from 12 (60 min) — conflicted with the
+                           # now-removed 0.5% stop-loss and was too long given
+                           # the entry quality penalty already discourages bad entries.
 
     # ── PPO Core ─────────────────────────────────────────────────────────────
-    total_timesteps = 2_000_000,
-    n_steps         = 2048,     # rollout length; try 4096 if rewards are sparse
-    batch_size      = 512,      # larger batch stable for big obs vector
-    n_epochs        = 8,        # passes per rollout; reduce to 4 if KL spikes
+    total_timesteps = 4_000_000,   # 2M→4M: v4's best result (+0.135%) was at
+                                   # step 1.94M still improving — needed more time.
+    n_steps         = 2048,
+    batch_size      = 512,
+    n_epochs        = 8,
     gamma           = 0.99,
     gae_lambda      = 0.95,
     clip_epsilon    = 0.2,
-    ent_coef        = 0.10,     # raised from 0.05 — entropy collapsed to <0.001 by step 313K
-                                # even with 0.05 and warmup. With only 2 legal actions
-                                # (max entropy = ln(2) = 0.693) the coefficient needs to be
-                                # much stronger to compete with a dominant reward signal.
-    ent_coef_end    = 0.02,     # raised from 0.01 — keep meaningful entropy pressure throughout
-    ent_warmup_frac = 0.30,     # hold flat for first 30% before decaying
-    ent_floor       = 0.10,     # minimum entropy below which an extra penalty is applied
-                                # to push the policy back toward exploration
+    ent_coef        = 0.10,        # flat for first ent_warmup_frac of training
+    ent_coef_end    = 0.02,        # decays to this after warmup
+    ent_warmup_frac = 0.30,        # 30% flat warmup → 1.2M steps at full ent_coef
+    ent_floor       = 0.10,        # quadratic penalty if entropy drops below this
     vf_coef         = 0.5,
     max_grad_norm   = 0.5,
     target_kl       = 0.02,
 
-    # ── Learning Rate ────────────────────────────────────────────────────────
-    learning_rate = 1e-4,       # more conservative than transformer (big input)
-    lr_end        = 1e-5,
+    # ── Learning Rate — cosine schedule ──────────────────────────────────────
+    # Cosine annealing keeps LR higher for longer than linear decay, reducing
+    # the risk of locking into a local minimum early. In v4, linear decay made
+    # LR too small to escape after step ~1.5M — win rate peaked then declined.
+    learning_rate   = 1e-4,
+    lr_min          = 1e-5,        # cosine floor
 
     # ── MLP Architecture ─────────────────────────────────────────────────────
-    hidden_sizes  = [512, 256], # shared backbone layers
-    dropout       = 0.1,        # light dropout on backbone
+    hidden_sizes    = [512, 256],
+    dropout         = 0.1,
 
     # ── Training Control ─────────────────────────────────────────────────────
-    seed           = 42,
-    log_interval   = 10,        # episodes between console lines
-    save_interval  = 100_000,   # steps between checkpoints
-    device         = "cuda" if torch.cuda.is_available() else "cpu",
+    seed            = 42,
+    log_interval    = 10,          # rollouts between console prints
+    save_interval   = 100_000,     # steps between model checkpoints
+    device          = "cuda" if torch.cuda.is_available() else "cpu",
 
     # Resume from a checkpoint (set to path string to continue, or None)
-    continue_from  = None,
+    continue_from   = None,
 )
 
 
@@ -410,6 +407,23 @@ def linear_schedule(start, end, fraction):
     return start + fraction * (end - start)
 
 
+def cosine_lr_schedule(cfg: dict, progress: float) -> float:
+    """
+    Cosine annealing learning rate schedule.
+
+    Keeps LR higher for longer than linear decay, then drops smoothly to
+    lr_min. This reduces the risk of converging to a local minimum early —
+    in v4, linear decay made LR too small to escape a suboptimal policy in
+    the final third of training (win rate peaked then declined).
+
+    Formula: lr_min + 0.5*(lr_max - lr_min)*(1 + cos(π * progress))
+    """
+    import math
+    lr_max = cfg["learning_rate"]
+    lr_min = cfg.get("lr_min", 1e-5)
+    return lr_min + 0.5 * (lr_max - lr_min) * (1.0 + math.cos(math.pi * progress))
+
+
 def entropy_schedule(cfg: dict, progress: float) -> float:
     """
     Entropy coefficient schedule with a flat warmup period.
@@ -461,6 +475,7 @@ def train(cfg: dict):
         min_hold_steps= cfg["min_hold_steps"],
         log_dir       = cfg["log_dir"],
     )
+    env._prev_total = 0.0   # used to diff total_profit_pct per episode
     obs, info = env.reset()
 
     # ── Model ────────────────────────────────────────────────────────────────
@@ -512,7 +527,7 @@ def train(cfg: dict):
     while global_step < cfg["total_timesteps"]:
 
         progress = global_step / cfg["total_timesteps"]
-        lr_now   = linear_schedule(cfg["learning_rate"], cfg["lr_end"], progress)
+        lr_now   = cosine_lr_schedule(cfg, progress)
         ent_now  = entropy_schedule(cfg, progress)
         for pg in optimiser.param_groups:
             pg["lr"] = lr_now
@@ -554,10 +569,12 @@ def train(cfg: dict):
 
             if done:
                 ep_rewards.append(ep_reward)
-                ep_lengths.append(env.episode_steps)          # explicit counter, never negative
-                ep_wins.append(1 if ep_reward > 0 else 0)
-                ep_profits.append(ep_reward * 100)
-                ep_not_buys.append(env.episode_not_buys)      # NOT_BUY steps this episode
+                ep_lengths.append(env.episode_steps)
+                last_profit = env.total_profit_pct - getattr(env, '_prev_total', 0.0)
+                env._prev_total = env.total_profit_pct
+                ep_wins.append(1 if last_profit > 0 else 0)
+                ep_profits.append(last_profit)
+                ep_not_buys.append(env.episode_not_buys)
                 obs, info = env.reset()
                 ep_reward = 0.0
 
@@ -580,19 +597,30 @@ def train(cfg: dict):
         writer.add_scalar("train/ent_coef",      ent_now,                 global_step)
 
         if ep_rewards:
-            win_r  = float(np.mean(ep_wins))
-            mean_r = float(np.mean(ep_rewards))
-            mean_nb = float(np.mean(ep_not_buys)) if ep_not_buys else 0.0
+            win_r    = float(np.mean(ep_wins))
+            mean_r   = float(np.mean(ep_rewards))
+            mean_nb  = float(np.mean(ep_not_buys)) if ep_not_buys else 0.0
             mean_len = float(np.mean(ep_lengths))
-            # NOT_BUY fraction: what share of episode steps were NOT_BUY
-            nb_frac = mean_nb / max(mean_len, 1.0)
+            mean_mp  = float(np.mean(ep_profits))
 
-            writer.add_scalar("rollout/mean_ep_reward",   mean_r,    global_step)
-            writer.add_scalar("rollout/mean_ep_length",   mean_len,  global_step)
-            writer.add_scalar("rollout/win_rate",         win_r,     global_step)
-            writer.add_scalar("rollout/mean_profit_pct",  float(np.mean(ep_profits)), global_step)
-            writer.add_scalar("rollout/mean_not_buy_steps", mean_nb, global_step)
-            writer.add_scalar("rollout/not_buy_fraction", nb_frac,   global_step)
+            # ── not_buy_fraction fix ──────────────────────────────────────────
+            # In a single-trade episode, Phase 1 has exactly (mean_nb NOT_BUY
+            # steps + 1 BUY step). The correct fraction of Phase 1 entry
+            # decisions that are NOT_BUY is therefore mean_nb / (mean_nb + 1).
+            #
+            # The previous formula mean_nb / mean_len divided by total episode
+            # length, which includes all Phase 2 HOLD steps — this caused the
+            # metric to read ~8% when the agent was declining to buy on ~52% of
+            # its actual Phase 1 decisions, a 44pp undercount that made it
+            # impossible to detect entry selectivity changes in TensorBoard.
+            nb_frac = mean_nb / max(mean_nb + 1.0, 1.0)
+
+            writer.add_scalar("rollout/mean_ep_reward",     mean_r,   global_step)
+            writer.add_scalar("rollout/mean_ep_length",     mean_len, global_step)
+            writer.add_scalar("rollout/win_rate",           win_r,    global_step)
+            writer.add_scalar("rollout/mean_profit_pct",    mean_mp,  global_step)
+            writer.add_scalar("rollout/mean_not_buy_steps", mean_nb,  global_step)
+            writer.add_scalar("rollout/not_buy_fraction",   nb_frac,  global_step)
 
         new_ep = env.episode_counter - ep_count
         ep_count = env.episode_counter
