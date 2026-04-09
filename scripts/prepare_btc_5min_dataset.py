@@ -2,16 +2,28 @@
 prepare_btc_5min_dataset.py
 
 Engineers the 38 Boruta-confirmed features for the 5-minute BTCTradingEnv
-from the ServoTrader 5-minute OHLCV file.
+from the ServoTrader 5-minute OHLCV file, then produces a clean chronological
+train / test split for objective model evaluation.
 
 Source file
 -----------
     /home/jarred/git/ServoTrader/data/5min_historical/BTCUSDT.csv
     Columns: timestamp, open, high, low, close, vwap, volume, count, symbol
 
-Output
-------
-    /home/jarred/git/ServoTrader/data/btc_5min_features.csv
+Outputs
+-------
+    /home/jarred/git/ServoTrader/data/btc_5min_features.csv   — full prepared dataset
+    /home/jarred/git/ServoTrader/data/btc_5min_train.csv      — training split  (first 80%)
+    /home/jarred/git/ServoTrader/data/btc_5min_test.csv       — test split      (last  20%)
+
+Split policy
+------------
+The split is strictly chronological. The training set contains the oldest 80%
+of candles; the test set contains the most recent 20%. The test set is held out
+completely — it must never be used for training or hyperparameter tuning.
+
+  80 % train  ≈ 6.8 years  (with ~8.5 years of full history)
+  20 % test   ≈ 1.7 years
 
 38 Boruta-Confirmed Features (importance order)
 ------------------------------------------------
@@ -71,12 +83,20 @@ import warnings
 import numpy as np
 import pandas as pd
 
+
 # ---------------------------------------------------------------------------
 #  Paths
 # ---------------------------------------------------------------------------
 
-OHLCV_PATH  = "/home/jarred/git/ServoTrader/data/individual_crypto_csvs_ancient_5_min/BTCUSDT.csv"
-OUTPUT_PATH = "/home/jarred/git/ServoTrader/data/btc_5min_features.csv"
+OHLCV_PATH   = "/home/jarred/git/ServoTrader/data/5min_historical/BTCUSDT.csv"
+OUTPUT_FULL  = "/home/jarred/git/ServoTrader/data/btc_5min_features.csv"
+OUTPUT_TRAIN = "/home/jarred/git/ServoTrader/data/btc_5min_train.csv"
+OUTPUT_TEST  = "/home/jarred/git/ServoTrader/data/btc_5min_test.csv"
+
+# Fraction of prepared rows assigned to the training set.
+# The remaining (1 - TRAIN_RATIO) fraction becomes the held-out test set.
+# The split is strictly chronological: train = oldest, test = most recent.
+TRAIN_RATIO = 0.80
 
 # Must match BORUTA_FEATURES in btc_trading_env_5m.py exactly
 FEATURE_COLS = [
@@ -155,7 +175,7 @@ def _bollinger(close: pd.Series, window: int, n_std: float = 2.0):
     upper = ma + n_std * sigma
     lower = ma - n_std * sigma
     pct_b     = (close - lower) / (upper - lower + 1e-12)
-    bandwidth = (upper - lower) / (ma + 1e-12)          # normalised by mid-band
+    bandwidth = (upper - lower) / (ma + 1e-12)
     return pct_b, bandwidth
 
 
@@ -174,7 +194,6 @@ def _atr(high, low, close, period):
         (high - ph).abs(),
         (low  - ph).abs(),
     ], axis=1).max(axis=1)
-    # Wilder smoothing (EWM, matches the style used throughout the project)
     return tr.ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean()
 
 
@@ -201,10 +220,21 @@ def _vwap_deviation(close, vwap):
 # ---------------------------------------------------------------------------
 
 def prepare_dataset(
-    ohlcv_path:  str  = OHLCV_PATH,
-    output_path: str  = OUTPUT_PATH,
-    verbose:     bool = True,
-) -> pd.DataFrame:
+    ohlcv_path:   str   = OHLCV_PATH,
+    output_full:  str   = OUTPUT_FULL,
+    output_train: str   = OUTPUT_TRAIN,
+    output_test:  str   = OUTPUT_TEST,
+    train_ratio:  float = TRAIN_RATIO,
+    verbose:      bool  = True,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Load raw OHLCV, engineer all 38 features, save the full dataset, then
+    produce and save a chronological train/test split.
+
+    Returns
+    -------
+    (train_df, test_df) — both include timestamp + OHLCV base columns + features.
+    """
 
     SEP = "=" * 70
 
@@ -218,7 +248,7 @@ def prepare_dataset(
     if not os.path.exists(ohlcv_path):
         raise FileNotFoundError(
             f"5-minute OHLCV file not found: {ohlcv_path}\n"
-            "Expected location: data/5min_historical/BTCUSDT.csv"
+            "Run fetch_btc_5min_historical.py first to download the raw data."
         )
 
     df = pd.read_csv(ohlcv_path)
@@ -256,7 +286,9 @@ def prepare_dataset(
     df = df.drop(columns=["symbol"], errors="ignore")
 
     if verbose:
+        raw_days = len(df) * 5 / 60 / 24
         print(f"  ✅  {len(df):,} rows | {df['timestamp'].min()} → {df['timestamp'].max()}")
+        print(f"      ≈ {raw_days:.0f} days ({raw_days / 365:.1f} years) of 5-min bars")
 
     # ── 2. Engineer features ──────────────────────────────────────────────────
     if verbose:
@@ -270,11 +302,11 @@ def prepare_dataset(
     volume = df["volume"]
     vwap   = df["vwap"]
 
-    # --- Bollinger Bands (3 windows) ---
-    df["bb_percent_b_12"], df["bb_bandwidth_12"] = _bollinger(close, 12)   # 1h
-    df["bb_percent_b_24"], df["bb_bandwidth_24"] = _bollinger(close, 24)   # 2h
-    df["bb_percent_b_48"], df["bb_bandwidth_48"] = _bollinger(close, 48)   # 4h
-    df["bb_percent_b_72"], df["bb_bandwidth_72"] = _bollinger(close, 72)   # 6h
+    # --- Bollinger Bands (4 windows) ---
+    df["bb_percent_b_12"], df["bb_bandwidth_12"] = _bollinger(close, 12)
+    df["bb_percent_b_24"], df["bb_bandwidth_24"] = _bollinger(close, 24)
+    df["bb_percent_b_48"], df["bb_bandwidth_48"] = _bollinger(close, 48)
+    df["bb_percent_b_72"], df["bb_bandwidth_72"] = _bollinger(close, 72)
 
     # --- RSI (5 periods) ---
     df["rsi_6"]  = _wilder_rsi(close, 6)
@@ -340,34 +372,66 @@ def prepare_dataset(
             warnings.warn(f"[DataPrep] {col}: {n_inf} Inf, {n_nan} NaN remain — replacing with 0")
             df[col] = df[col].replace([np.inf, -np.inf], 0.0).fillna(0.0)
 
-    # ── 5. Save ───────────────────────────────────────────────────────────────
+    # ── 5. Select output columns ──────────────────────────────────────────────
     keep = ["timestamp", "open", "high", "low", "close", "vwap", "volume"] + FEATURE_COLS
     keep = [c for c in keep if c in df.columns]
     out  = df[keep].copy()
 
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    out.to_csv(output_path, index=False)
+    # ── 6. Save full prepared dataset ─────────────────────────────────────────
+    os.makedirs(os.path.dirname(output_full),  exist_ok=True)
+    os.makedirs(os.path.dirname(output_train), exist_ok=True)
+    os.makedirs(os.path.dirname(output_test),  exist_ok=True)
 
-    # ── 6. Summary ────────────────────────────────────────────────────────────
+    out.to_csv(output_full, index=False)
+
+    # ── 7. Chronological train / test split ───────────────────────────────────
+    n_total = len(out)
+    n_train = int(n_total * train_ratio)
+    # Ensure the split lands on a clean boundary — no row belongs to both sets
+    n_test  = n_total - n_train
+
+    train_df = out.iloc[:n_train].reset_index(drop=True)
+    test_df  = out.iloc[n_train:].reset_index(drop=True)
+
+    train_df.to_csv(output_train, index=False)
+    test_df.to_csv(output_test,   index=False)
+
+    # ── 8. Summary ────────────────────────────────────────────────────────────
     if verbose:
+        train_days = n_train * 5 / 60 / 24
+        test_days  = n_test  * 5 / 60 / 24
+
         print(f"\n{SEP}")
-        print(f"  ✅  COMPLETE")
-        print(f"  Saved {len(out):,} rows → {output_path}")
-        print(f"  Date range: {out['timestamp'].min()} → {out['timestamp'].max()}")
-        print(f"  Approx training duration: {len(out) * 5 / 60 / 24:.0f} days of 5-min bars")
+        print("  ✅  COMPLETE")
         print(SEP)
-        print("\n  Feature statistics:")
-        print(out[FEATURE_COLS].describe().round(4).to_string())
+        print(f"\n  Full dataset")
+        print(f"    Rows      : {n_total:,}")
+        print(f"    Date range: {out['timestamp'].min()} → {out['timestamp'].max()}")
+        print(f"    Coverage  : ≈{n_total * 5 / 60 / 24:.0f} days ({n_total * 5 / 60 / 24 / 365:.1f} years)")
+        print(f"    Saved to  : {output_full}")
+
+        print(f"\n  Train split  ({train_ratio * 100:.0f}%)")
+        print(f"    Rows      : {n_train:,}")
+        print(f"    Date range: {train_df['timestamp'].min()} → {train_df['timestamp'].max()}")
+        print(f"    Coverage  : ≈{train_days:.0f} days ({train_days / 365:.1f} years)")
+        print(f"    Saved to  : {output_train}")
+
+        print(f"\n  Test split  ({(1 - train_ratio) * 100:.0f}%)  ← HELD OUT — do not use for training")
+        print(f"    Rows      : {n_test:,}")
+        print(f"    Date range: {test_df['timestamp'].min()} → {test_df['timestamp'].max()}")
+        print(f"    Coverage  : ≈{test_days:.0f} days ({test_days / 365:.1f} years)")
+        print(f"    Saved to  : {output_test}")
+
         print(f"\n{SEP}")
-        print("  Value range check:")
+        print("\n  Feature value range check:")
         for col in FEATURE_COLS:
-            mn = float(out[col].min())
-            mx = float(out[col].max())
+            mn   = float(out[col].min())
+            mx   = float(out[col].max())
             flag = "✅" if abs(mn) < 1e6 and abs(mx) < 1e6 else "⚠ "
             print(f"    {flag}  {col:<22}  min={mn:>14.4f}   max={mx:>14.4f}")
-        print(SEP + "\n")
+        print(f"{SEP}\n")
 
-    return out
+    return train_df, test_df
 
 
 if __name__ == "__main__":
