@@ -136,8 +136,16 @@ def _clean_df(df: pd.DataFrame) -> pd.DataFrame:
     df["vwap"] = df["quote_volume"] / df["volume"].replace(0, float("nan"))
     df["vwap"] = df["vwap"].replace([float("inf"), -float("inf")], float("nan"))
 
+    # Binance archive files from 2025 onwards store timestamps in microseconds
+    # rather than milliseconds. Detect by magnitude and normalise to milliseconds.
+    #   ms timestamp for 2025  ≈ 1.7e12
+    #   µs timestamp for 2025  ≈ 1.7e15  (1000× larger)
+    raw_ts = pd.to_numeric(df["open_time"], errors="coerce")
+    if raw_ts.iloc[0] > 1e14:          # value is in microseconds — divide to ms
+        raw_ts = raw_ts // 1000
+
     df["timestamp"] = pd.to_datetime(
-        df["open_time"].astype("int64"), unit="ms", utc=True
+        raw_ts.astype("int64"), unit="ms", utc=True
     ).dt.tz_localize(None)   # timezone-naive UTC, consistent with prepare script
 
     df["symbol"] = SYMBOL

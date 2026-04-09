@@ -103,7 +103,7 @@ from servo_trader.envs.btc_trading_env_5m import (
 
 CFG = dict(
     # ── Paths ────────────────────────────────────────────────────────────────
-    data_path   = "/home/jarred/git/ServoTrader/data/btc_5min_features.csv",
+    data_path = "/home/jarred/git/ServoTrader/data/btc_5min_train.csv",
     model_dir   = "/home/jarred/git/ServoTrader/models",
     log_dir     = "/home/jarred/git/ServoTrader/logs",
     tb_log_dir  = "/home/jarred/git/ServoTrader/logs/tb",
@@ -463,10 +463,8 @@ def train(cfg: dict):
     print(f"[Train] Dataset: {len(df):,} rows | {len(BORUTA_FEATURES)} features")
 
     # Train / validation split (last 20% as holdout — never touch during training)
-    split = int(len(df) * 0.80)
-    df_train = df.iloc[:split].reset_index(drop=True)
-    df_val   = df.iloc[split:].reset_index(drop=True)
-    print(f"[Train] Train  : {len(df_train):,} rows | Val: {len(df_val):,} rows")
+    df_train = df.reset_index(drop=True)
+    print(f"[Train] Train rows: {len(df_train):,}")
 
     # ── Environment ──────────────────────────────────────────────────────────
     env = BTCTradingEnv5m(
