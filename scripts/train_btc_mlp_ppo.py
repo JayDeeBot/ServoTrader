@@ -103,21 +103,22 @@ from servo_trader.envs.btc_trading_env_5m import (
 
 CFG = dict(
     # ── Paths ────────────────────────────────────────────────────────────────
-    data_path = "/home/jarred/git/ServoTrader/data/btc_5min_train.csv",
+    data_path   = "/home/jarred/git/ServoTrader/data/btc_5min_features.csv",
     model_dir   = "/home/jarred/git/ServoTrader/models",
     log_dir     = "/home/jarred/git/ServoTrader/logs",
     tb_log_dir  = "/home/jarred/git/ServoTrader/logs/tb",
     model_name  = "btc_mlp_ppo",
 
     # ── Environment ──────────────────────────────────────────────────────────
-    # Single-trade episodes: one BUY/SELL cycle per episode. Reverted from
-    # v5's multi-trade windows because the 0.5% stop-loss made trading so
-    # costly that the agent rationally refused to trade (NOT_BUY rose to 56%).
     max_hold_steps = 72,   # 6-hour forced exit ceiling
-    min_hold_steps = 6,    # 30-min minimum hold before SELL is legal.
-                           # Reverted from 12 (60 min) — conflicted with the
-                           # now-removed 0.5% stop-loss and was too long given
-                           # the entry quality penalty already discourages bad entries.
+    min_hold_steps = 18,   # 90-min minimum hold before SELL is legal.
+                           # Increased from 6 (30 min) — at 6 candles the agent
+                           # converged to "sell at first legal opportunity" in
+                           # every episode, giving a mean hold of only 36 min.
+                           # 18 candles forces the agent into a longer learning
+                           # regime where the 38 features have more time to
+                           # express predictive power and a single noisy candle
+                           # cannot dominate the trade outcome.
 
     # ── PPO Core ─────────────────────────────────────────────────────────────
     total_timesteps = 4_000_000,   # 2M→4M: v4's best result (+0.135%) was at
@@ -463,8 +464,10 @@ def train(cfg: dict):
     print(f"[Train] Dataset: {len(df):,} rows | {len(BORUTA_FEATURES)} features")
 
     # Train / validation split (last 20% as holdout — never touch during training)
-    df_train = df.reset_index(drop=True)
-    print(f"[Train] Train rows: {len(df_train):,}")
+    split = int(len(df) * 0.80)
+    df_train = df.iloc[:split].reset_index(drop=True)
+    df_val   = df.iloc[split:].reset_index(drop=True)
+    print(f"[Train] Train  : {len(df_train):,} rows | Val: {len(df_val):,} rows")
 
     # ── Environment ──────────────────────────────────────────────────────────
     env = BTCTradingEnv5m(

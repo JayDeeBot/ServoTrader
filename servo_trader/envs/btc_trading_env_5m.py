@@ -220,13 +220,30 @@ class BTCTradingEnv5m(gym.Env):
             if self.in_position:
                 reward = -0.01
             else:
-                # Entry quality shaping: look ahead min_hold_steps candles.
-                # Penalise buying into a declining market, proportional to
-                # expected loss, capped at one trading cost.
-                future_idx    = min(self.current_step + self.min_hold_steps, self.n_rows - 1)
-                future_price  = self.close_prices[future_idx]
-                hypothetical  = (future_price / max(current_price, 1e-12)) - 1.0
-                entry_penalty = max(hypothetical, -TRADE_COST) if hypothetical < 0 else 0.0
+                # Momentum-based entry penalty — causal only, no lookahead.
+                # returns_1p and returns_3p are past prices already present
+                # in the observation at the moment of the BUY decision, so
+                # this introduces no train/test discrepancy.
+                #
+                # Rationale: 5-minute momentum strongly tends to mean-revert
+                # over the subsequent 30–90 minutes. Buying immediately after
+                # a sharp rise is the dominant failure mode identified in the
+                # previous run (win rate 20.7%, well below the ~50% random
+                # baseline). This penalty discourages momentum-chasing entries
+                # without relying on future price data.
+                #
+                # Mechanics:
+                #   momentum = mean(returns_1p, returns_3p) at current step
+                #   penalty  = -momentum * 2.0  when momentum > 0 (chasing)
+                #              0.0              when momentum ≤ 0 (not chasing)
+                #   capped at -TRADE_COST so the penalty never exceeds the
+                #   round-trip trading cost.
+                ret_1p    = float(self.df["returns_1p"].iloc[self.current_step])
+                ret_3p    = float(self.df["returns_3p"].iloc[self.current_step])
+                momentum  = (ret_1p + ret_3p) / 2.0
+                # Negative only when momentum > 0 (penalise chasing, not dips)
+                entry_penalty = min(-momentum * 2.0, 0.0)
+                entry_penalty = max(entry_penalty, -TRADE_COST)
 
                 self.in_position    = True
                 self.buy_price      = current_price
