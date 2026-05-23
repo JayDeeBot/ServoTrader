@@ -7,14 +7,16 @@ multi-trade (v5+) episode formats.
 
 Usage
 -----
-    python scripts/analyze_episode_log.py              # latest log
-    python scripts/analyze_episode_log.py --log /path/to/file.jsonl
-    python scripts/analyze_episode_log.py --actions    # show action breakdown
+    python3 scripts/analyze_episode_log.py              # latest log
+    python3 scripts/analyze_episode_log.py --log /path/to/file.jsonl
+    python3 scripts/analyze_episode_log.py --actions    # show action breakdown
 
 Author: Jarred Deluca
 Project: ServoTrader
 License: MIT
 """
+
+# rm -rf /home/jarred/git/ServoTrader/logs/tb/*
 
 import os
 import json

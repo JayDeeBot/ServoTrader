@@ -103,7 +103,7 @@ from servo_trader.envs.btc_trading_env_5m import (
 
 CFG = dict(
     # ── Paths ────────────────────────────────────────────────────────────────
-    data_path   = "/home/jarred/git/ServoTrader/data/btc_5min_features.csv",
+    data_path   = "/home/jarred/git/ServoTrader/data/btc_5min_train.csv",
     model_dir   = "/home/jarred/git/ServoTrader/models",
     log_dir     = "/home/jarred/git/ServoTrader/logs",
     tb_log_dir  = "/home/jarred/git/ServoTrader/logs/tb",
@@ -111,36 +111,30 @@ CFG = dict(
 
     # ── Environment ──────────────────────────────────────────────────────────
     max_hold_steps = 72,   # 6-hour forced exit ceiling
-    min_hold_steps = 18,   # 90-min minimum hold before SELL is legal.
-                           # Increased from 6 (30 min) — at 6 candles the agent
-                           # converged to "sell at first legal opportunity" in
-                           # every episode, giving a mean hold of only 36 min.
-                           # 18 candles forces the agent into a longer learning
-                           # regime where the 38 features have more time to
-                           # express predictive power and a single noisy candle
-                           # cannot dominate the trade outcome.
+    min_hold_steps = 18,   # 90-min minimum hold. At 6 candles the agent
+                           # converged to "sell at first legal opportunity"
+                           # every episode, giving no signal for the features.
 
     # ── PPO Core ─────────────────────────────────────────────────────────────
-    total_timesteps = 4_000_000,   # 2M→4M: v4's best result (+0.135%) was at
-                                   # step 1.94M still improving — needed more time.
-    n_steps         = 2048,
+    total_timesteps = 6_000_000,
+    n_steps         = 4096,        # ~195 episodes/rollout with mean ep_len=21
     batch_size      = 512,
     n_epochs        = 8,
     gamma           = 0.99,
     gae_lambda      = 0.95,
     clip_epsilon    = 0.2,
-    ent_coef        = 0.10,        # flat for first ent_warmup_frac of training
-    ent_coef_end    = 0.02,        # decays to this after warmup
-    ent_warmup_frac = 0.30,        # 30% flat warmup → 1.2M steps at full ent_coef
-    ent_floor       = 0.10,        # quadratic penalty if entropy drops below this
-    vf_coef         = 0.5,
+    ent_coef        = 0.10,
+    ent_coef_end    = 0.02,
+    ent_warmup_frac = 0.30,
+    ent_floor       = 0.0,         # removed — fired spuriously on forced-HOLD steps
+    vf_coef         = 1.0,         # doubled to keep critic learning
     max_grad_norm   = 0.5,
     target_kl       = 0.02,
 
     # ── Learning Rate — cosine schedule ──────────────────────────────────────
-    # Cosine annealing keeps LR higher for longer than linear decay, reducing
-    # the risk of locking into a local minimum early. In v4, linear decay made
-    # LR too small to escape after step ~1.5M — win rate peaked then declined.
+    # Reverted to 1e-4/1e-5. Runs at 3e-4 and 5e-4 were progressively worse
+    # (Q4 win rate: 32.7% → 28.2% → 27.6%). Higher LR overshoots the weak
+    # gradient signal in this environment.
     learning_rate   = 1e-4,
     lr_min          = 1e-5,        # cosine floor
 
@@ -154,7 +148,11 @@ CFG = dict(
     save_interval   = 100_000,     # steps between model checkpoints
     device          = "cuda" if torch.cuda.is_available() else "cpu",
 
-    # Resume from a checkpoint (set to path string to continue, or None)
+    # Resume from a checkpoint — set to None for a clean fresh start.
+    # Starting fresh because curriculum sampling changes the episode distribution
+    # substantially; weights trained on uniform sampling would need to fully
+    # unlearn before adapting. The latest checkpoint is also from the lr=5e-4
+    # run (worst result), so there is nothing worth preserving from it.
     continue_from   = None,
 )
 
@@ -344,9 +342,15 @@ def ppo_update(model, optimiser, buffer, last_value, cfg, ent_coef) -> dict:
     max_gnorm  = cfg["max_grad_norm"]
     target_kl  = cfg["target_kl"]
     batch_size = cfg["batch_size"]
-    ent_floor  = cfg.get("ent_floor", 0.10)   # minimum entropy threshold
-
     buffer.compute_gae(last_value, cfg["gamma"], cfg["gae_lambda"])
+
+    # Normalise returns (not raw rewards) so the critic has stable unit-variance
+    # targets. Normalising rewards before GAE pollutes the discounting calculation
+    # and creates oscillating return scale — normalising returns directly is more
+    # principled and eliminated the late-training critic instability seen in prior runs.
+    ret_std = buffer.returns.std()
+    if ret_std > 1e-8:
+        buffer.returns = (buffer.returns - buffer.returns.mean()) / (ret_std + 1e-8)
 
     adv = buffer.advantages
     buffer.advantages = (adv - adv.mean()) / (adv.std() + 1e-8)
@@ -363,20 +367,17 @@ def ppo_update(model, optimiser, buffer, last_value, cfg, ent_coef) -> dict:
             pg_loss = -torch.min(ratio * adv_b, clipped).mean()
             vf_loss = 0.5 * (values - ret_b).pow(2).mean()
 
-            # Standard entropy bonus (encourages exploration)
-            mean_entropy = entropy.mean()
-            ent_loss     = -mean_entropy
+            # Masking-aware entropy: only compute at steps with ≥2 legal actions.
+            # 75% of rollout steps are forced-HOLD (mask entropy=0 structurally),
+            # so averaging over all steps caused severe misreading of policy health.
+            decision_mask = mask_b.sum(dim=-1) > 1
+            if decision_mask.any():
+                mean_entropy = entropy[decision_mask].mean()
+            else:
+                mean_entropy = entropy.mean()
+            ent_loss = -mean_entropy
 
-            # Entropy floor: apply an extra quadratic penalty when mean entropy
-            # drops below ent_floor. This kicks in only when the policy is
-            # becoming dangerously deterministic, pushing it back toward
-            # exploration without over-regularising when entropy is healthy.
-            # In previous runs entropy collapsed to <0.001 by step 313K despite
-            # ent_coef=0.05 — the floor catches this before it becomes permanent.
-            floor_violation = torch.clamp(ent_floor - mean_entropy, min=0.0)
-            floor_penalty   = 2.0 * floor_violation.pow(2)   # quadratic, so gentle near floor
-
-            loss = pg_loss + vf_coef * vf_loss + ent_coef * ent_loss + floor_penalty
+            loss = pg_loss + vf_coef * vf_loss + ent_coef * ent_loss
 
             optimiser.zero_grad()
             loss.backward()
@@ -463,11 +464,9 @@ def train(cfg: dict):
     df = pd.read_csv(cfg["data_path"])
     print(f"[Train] Dataset: {len(df):,} rows | {len(BORUTA_FEATURES)} features")
 
-    # Train / validation split (last 20% as holdout — never touch during training)
-    split = int(len(df) * 0.80)
-    df_train = df.iloc[:split].reset_index(drop=True)
-    df_val   = df.iloc[split:].reset_index(drop=True)
-    print(f"[Train] Train  : {len(df_train):,} rows | Val: {len(df_val):,} rows")
+    # Train/test split enforced upstream via btc_5min_train.csv.
+    df_train = df.reset_index(drop=True)
+    print(f"[Train] Train rows : {len(df_train):,}")
 
     # ── Environment ──────────────────────────────────────────────────────────
     env = BTCTradingEnv5m(
@@ -496,8 +495,8 @@ def train(cfg: dict):
     if cfg.get("continue_from") and os.path.exists(cfg["continue_from"]):
         ckpt = torch.load(cfg["continue_from"], map_location=device)
         model.load_state_dict(ckpt["model"])
-        global_step = ckpt.get("global_step", 0)
-        print(f"[Train] Resumed from step {global_step:,}")
+        global_step = 0   # reset schedules; keep trained weights
+        print(f"[Train] Resumed weights — schedules reset to step 0")
 
     optimiser = optim.Adam(model.parameters(), lr=cfg["learning_rate"], eps=1e-5)
 

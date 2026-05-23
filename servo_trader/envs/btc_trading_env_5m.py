@@ -129,6 +129,10 @@ class BTCTradingEnv5m(gym.Env):
         self.max_hold_steps = int(max_hold_steps)
         self.min_hold_steps = int(min_hold_steps)
 
+        # Precompute curriculum sampling weights for episode start positions.
+        # Computed once here so reset() stays fast.
+        self._start_weights = self._build_curriculum_weights()
+
         # Action / observation spaces
         self.action_space = spaces.Discrete(4)
         low  = np.full(OBS_DIM, -10.0, dtype=np.float32)
@@ -178,7 +182,9 @@ class BTCTradingEnv5m(gym.Env):
         if max_start <= min_start:
             max_start = min_start + 1
 
-        self.current_step     = int(self.np_random.integers(min_start, max_start))
+        self.current_step     = int(min_start + self.np_random.choice(
+                                    len(self._start_weights), p=self._start_weights
+                                ))
         self.in_position      = False
         self.buy_price        = 0.0
         self.prev_price       = self.close_prices[self.current_step]
@@ -212,7 +218,14 @@ class BTCTradingEnv5m(gym.Env):
             if self.in_position:
                 reward = -0.01   # illegal in Phase 2
             else:
-                reward = -0.0001
+                # NOT_BUY penalty raised from -0.0001 to -0.001.
+                # The original penalty was so small (~33x below TRADE_COST) that
+                # it provided no gradient signal for Phase 1 selectivity — 59.5%
+                # of episodes had zero NOT_BUY steps, meaning the agent defaulted
+                # to immediate entry with no discrimination. At -0.001, waiting
+                # 1 step costs 33% of one TRADE_COST, making entry timing a
+                # meaningful decision without punishing legitimate patience.
+                reward = -0.001
                 self.episode_not_buys += 1
                 self._log_step(action, "not_buy", current_price, 0.0, reward)
 
@@ -220,30 +233,13 @@ class BTCTradingEnv5m(gym.Env):
             if self.in_position:
                 reward = -0.01
             else:
-                # Momentum-based entry penalty — causal only, no lookahead.
-                # returns_1p and returns_3p are past prices already present
-                # in the observation at the moment of the BUY decision, so
-                # this introduces no train/test discrepancy.
-                #
-                # Rationale: 5-minute momentum strongly tends to mean-revert
-                # over the subsequent 30–90 minutes. Buying immediately after
-                # a sharp rise is the dominant failure mode identified in the
-                # previous run (win rate 20.7%, well below the ~50% random
-                # baseline). This penalty discourages momentum-chasing entries
-                # without relying on future price data.
-                #
-                # Mechanics:
-                #   momentum = mean(returns_1p, returns_3p) at current step
-                #   penalty  = -momentum * 2.0  when momentum > 0 (chasing)
-                #              0.0              when momentum ≤ 0 (not chasing)
-                #   capped at -TRADE_COST so the penalty never exceeds the
-                #   round-trip trading cost.
-                ret_1p    = float(self.df["returns_1p"].iloc[self.current_step])
-                ret_3p    = float(self.df["returns_3p"].iloc[self.current_step])
-                momentum  = (ret_1p + ret_3p) / 2.0
-                # Negative only when momentum > 0 (penalise chasing, not dips)
-                entry_penalty = min(-momentum * 2.0, 0.0)
-                entry_penalty = max(entry_penalty, -TRADE_COST)
+                # Entry quality shaping: look ahead min_hold_steps candles.
+                # Penalise buying into a declining market, proportional to
+                # expected loss, capped at one trading cost.
+                future_idx    = min(self.current_step + self.min_hold_steps, self.n_rows - 1)
+                future_price  = self.close_prices[future_idx]
+                hypothetical  = (future_price / max(current_price, 1e-12)) - 1.0
+                entry_penalty = max(hypothetical, -TRADE_COST) if hypothetical < 0 else 0.0
 
                 self.in_position    = True
                 self.buy_price      = current_price
@@ -310,6 +306,65 @@ class BTCTradingEnv5m(gym.Env):
                 f"[BTCTradingEnv5m] Missing columns: {missing}\n"
                 f"Run prepare_btc_5min_dataset.py first."
             )
+
+    def _build_curriculum_weights(self) -> np.ndarray:
+        """
+        Precompute episode start position sampling weights for curriculum learning.
+
+        Problem this solves
+        -------------------
+        With uniform random start positions, each rollout contains ~195 episodes
+        drawn from a stationary distribution. The vast majority of 5-minute
+        windows are low-signal (sideways market, small moves). The critic's best
+        prediction for any episode is the mean return (~-0.28%), so it converges
+        to a constant and stops learning. The policy gradient that flows back
+        through near-zero advantages produces no useful update.
+
+        Solution
+        ---------
+        Weight start positions by the absolute price move over the next
+        min_hold_steps candles. Positions where the market makes a strong
+        directional move produce high-variance episode outcomes — wins and losses
+        are more extreme, giving the critic a real loss surface. The agent still
+        only observes past data; the future price is used only to determine
+        which training episodes to sample (a standard curriculum technique).
+
+        Blending
+        ---------
+        70% curriculum (move-weighted) + 30% uniform. The uniform component
+        preserves coverage of quieter market regimes so the agent doesn't
+        over-specialise on volatile periods only.
+        """
+        min_start = HISTORY_WINDOW
+        max_start = self.n_rows - self.max_hold_steps - 2
+        n_valid   = max_start - min_start
+
+        # Absolute price return over next min_hold_steps candles from each start
+        weights = np.zeros(n_valid, dtype=np.float64)
+        for i in range(n_valid):
+            start_idx  = min_start + i
+            future_idx = min(start_idx + self.min_hold_steps, self.n_rows - 1)
+            weights[i] = abs(
+                self.close_prices[future_idx] / max(self.close_prices[start_idx], 1e-12) - 1.0
+            )
+
+        # Cap at 95th percentile to prevent extreme crash/spike events from
+        # dominating — we want diverse high-signal episodes, not crash reruns
+        cap     = np.percentile(weights, 95)
+        weights = np.clip(weights, 0.0, cap)
+
+        # Blend curriculum with uniform
+        w_norm  = weights / (weights.sum() + 1e-12)
+        uniform = np.ones(n_valid, dtype=np.float64) / n_valid
+        blended = 0.7 * w_norm + 0.3 * uniform
+
+        result  = (blended / blended.sum()).astype(np.float32)
+        print(
+            f"[BTCTradingEnv5m] Curriculum weights built | "
+            f"valid starts: {n_valid:,} | "
+            f"top-decile threshold: {np.percentile(weights, 90)*100:.3f}%"
+        )
+        return result
 
     def _build_feature_matrix(self) -> np.ndarray:
         """Z-score normalise all 38 features, clip to ±5σ."""
