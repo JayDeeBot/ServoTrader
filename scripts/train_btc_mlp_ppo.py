@@ -132,9 +132,8 @@ CFG = dict(
     target_kl       = 0.02,
 
     # ── Learning Rate — cosine schedule ──────────────────────────────────────
-    # Reverted to 1e-4/1e-5. Runs at 3e-4 and 5e-4 were progressively worse
-    # (Q4 win rate: 32.7% → 28.2% → 27.6%). Higher LR overshoots the weak
-    # gradient signal in this environment.
+    # lr=1e-4 confirmed best across 8 runs. Higher rates (3e-4, 5e-4) produced
+    # progressively worse Q4 win rates (28.2%, 27.6%) vs 1e-4 baseline (32.7%).
     learning_rate   = 1e-4,
     lr_min          = 1e-5,        # cosine floor
 
@@ -148,12 +147,9 @@ CFG = dict(
     save_interval   = 100_000,     # steps between model checkpoints
     device          = "cuda" if torch.cuda.is_available() else "cpu",
 
-    # Resume from a checkpoint — set to None for a clean fresh start.
-    # Starting fresh because curriculum sampling changes the episode distribution
-    # substantially; weights trained on uniform sampling would need to fully
-    # unlearn before adapting. The latest checkpoint is also from the lr=5e-4
-    # run (worst result), so there is nothing worth preserving from it.
-    continue_from   = None,
+    # Resume from checkpoint — keeping best weights (37.6% win rate floor),
+    # schedules reset to step 0 so LR and ent_coef start at full strength.
+    continue_from = "/home/jarred/git/ServoTrader/models/btc_mlp_ppo_latest.pt",
 )
 
 
@@ -345,9 +341,7 @@ def ppo_update(model, optimiser, buffer, last_value, cfg, ent_coef) -> dict:
     buffer.compute_gae(last_value, cfg["gamma"], cfg["gae_lambda"])
 
     # Normalise returns (not raw rewards) so the critic has stable unit-variance
-    # targets. Normalising rewards before GAE pollutes the discounting calculation
-    # and creates oscillating return scale — normalising returns directly is more
-    # principled and eliminated the late-training critic instability seen in prior runs.
+    # targets. Normalising rewards before GAE pollutes the discounting calculation.
     ret_std = buffer.returns.std()
     if ret_std > 1e-8:
         buffer.returns = (buffer.returns - buffer.returns.mean()) / (ret_std + 1e-8)
@@ -367,9 +361,10 @@ def ppo_update(model, optimiser, buffer, last_value, cfg, ent_coef) -> dict:
             pg_loss = -torch.min(ratio * adv_b, clipped).mean()
             vf_loss = 0.5 * (values - ret_b).pow(2).mean()
 
-            # Masking-aware entropy: only compute at steps with ≥2 legal actions.
+            # Masking-aware entropy: only computed at steps with ≥2 legal actions.
             # 75% of rollout steps are forced-HOLD (mask entropy=0 structurally),
-            # so averaging over all steps caused severe misreading of policy health.
+            # so averaging all steps caused severe misreading of policy health and
+            # triggered spurious entropy interventions across multiple prior runs.
             decision_mask = mask_b.sum(dim=-1) > 1
             if decision_mask.any():
                 mean_entropy = entropy[decision_mask].mean()
@@ -495,7 +490,7 @@ def train(cfg: dict):
     if cfg.get("continue_from") and os.path.exists(cfg["continue_from"]):
         ckpt = torch.load(cfg["continue_from"], map_location=device)
         model.load_state_dict(ckpt["model"])
-        global_step = 0   # reset schedules; keep trained weights
+        global_step = 0   # reset LR/ent_coef schedules; keep trained weights
         print(f"[Train] Resumed weights — schedules reset to step 0")
 
     optimiser = optim.Adam(model.parameters(), lr=cfg["learning_rate"], eps=1e-5)

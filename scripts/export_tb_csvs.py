@@ -19,7 +19,7 @@ Usage
     python3 scripts/ export_tb_csvs.py
 
     # Export a specific run directory
-    python3 scripts/export_tb_csvs.py --logdir /home/jarred/git/ServoTrader/logs/tb/events.out.tfevents.1778142294.jarred-GF62-7RD.118697.0
+    python3 scripts/export_tb_csvs.py --logdir /home/jarred/git/ServoTrader/logs/tb/events.out.tfevents.1779775535.jarred-GF62-7RD.60856.0
 
     # Change output directory
     python3 scripts/ export_tb_csvs.py --outdir /tmp/tb_export
