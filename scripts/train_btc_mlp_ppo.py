@@ -111,7 +111,7 @@ CFG = dict(
 
     # ── Environment ──────────────────────────────────────────────────────────
     max_hold_steps = 72,   # 6-hour forced exit ceiling
-    min_hold_steps = 18,   # 90-min minimum hold. At 6 candles the agent
+    min_hold_steps = 6,   # 90-min minimum hold. At 6 candles the agent
                            # converged to "sell at first legal opportunity"
                            # every episode, giving no signal for the features.
 
